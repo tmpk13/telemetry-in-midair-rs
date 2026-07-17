@@ -32,9 +32,16 @@
 | PB4 | SD CITO |
 | PB5 | SD COTI |
 | PA0 | SD CS |
+| PA9 | LED D6 |
+| PA10 | LED D5 |
+
+*Reset (RST) pad on back*
+
 
 ## Connectors
 #### JST SH
+*As of Version 1*
+
 **I2C** *(J6)*
 
 | Pin | Function |
@@ -43,5 +50,15 @@
 | 3 | SDA |
 | 2 | 3V3 |
 | 1 | GND |
+
+**SWD** *(J5)*
+
+| Pin | Function |
+|-|-|
+| 4 | SWDIO |
+| 3 | SWDCLK |
+| 2 | 3V3 |
+| 1 | GND |
+
 
 
