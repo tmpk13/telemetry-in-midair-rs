@@ -14,6 +14,13 @@ path = "./src/bin/main.rs"
 name = "wio-probe"
 path = "./src/bin/wio_probe.rs"
 
+[features]
+default = []
+# Extra console logging: every WIO link frame and each heartbeat ping
+# (link up/down transitions are always logged). Build with
+# `cargo run --release --features verbose`.
+verbose = []
+
 [dependencies]
 # ~1.0: the matched esp-rtos 0.2 / esp-radio 0.17 pair expects esp-hal
 # 1.0.x (1.1 breaks esp-phy / esp-rtos).

@@ -31,6 +31,8 @@ cd wio && cargo run --release                 # app, RTT console
 
 # ESP32-C6 (USB Serial/JTAG; console also lives there)
 cd esp && cargo run --release
+# ...with per-frame link + per-heartbeat logging:
+cd esp && cargo run --release --features verbose
 
 # bench tool: check over UART whether the WIO is alive (powers the rail,
 # pulses reset, probes factory AT firmware at 9600 and the link PING at
@@ -88,6 +90,12 @@ sleep/wake, config applied, firmware receive. The ESP prints each to its
 USB console (prefixed `wio:`) and notifies it on the status/log
 characteristic, so gps-gui-rs (or any BLE client) sees the same live log.
 Lines are ASCII, up to `link::LOG_MAX` (64) bytes.
+
+The ESP also pings the WIO (`cmd::PING`) every 3 s as a link heartbeat and
+prints `wio link up` / `wio link down` on transitions, so a crashed or
+mis-wired WIO shows on the console instead of just going silent. The
+`verbose` cargo feature adds a line per inbound WIO frame and per heartbeat
+ping (`cargo run --release --features verbose`).
 
 Config command ids (config characteristic, `[id, len, value]`):
 

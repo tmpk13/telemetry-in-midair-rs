@@ -60,6 +60,17 @@ use trouble_host::prelude::*;
 
 extern crate alloc;
 
+/// Like [`println!`] but only emits when the `verbose` cargo feature is on.
+/// The arguments are always type-checked; the call is dead-code eliminated
+/// in a non-verbose build.
+macro_rules! vprintln {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "verbose") {
+            ::esp_println::println!($($arg)*);
+        }
+    };
+}
+
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 1;
 
@@ -277,6 +288,16 @@ static LINK_LOCK: AsyncMutex<CriticalSectionRawMutex, ()> = AsyncMutex::new(());
 /// firmware stream.
 static FW_XFER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Whether the WIO answered the last heartbeat ping. Cleared on boot and
+/// whenever a ping goes unanswered, so the console reflects the live link
+/// state (see [`heartbeat_task`]).
+static LINK_UP: AtomicBool = AtomicBool::new(false);
+
+/// Period between WIO heartbeat pings.
+const HEARTBEAT_INTERVAL_S: u64 = 3;
+/// How long to wait for the WIO's ping ack before treating the link as down.
+const HEARTBEAT_TIMEOUT_MS: u64 = 500;
+
 /// Latest WIO status/log lines awaiting delivery to the connected central.
 /// The BLE characteristic value must match [`link::LOG_MAX`].
 const _: () = assert!(link::LOG_MAX == 64);
@@ -314,8 +335,44 @@ async fn wio_request(cmd: u8, payload: &[u8], timeout_ms: u64) -> Result<u16, u8
     }
 }
 
+/// Poll the WIO periodically so a dead or crashed link is visible on the
+/// console instead of just silence. Each tick pings the WIO and waits for
+/// its ack (fw version); up/down transitions are always logged, per-ping
+/// detail only under the `verbose` feature. Skipped while a bulk transfer
+/// owns the link (the transfer itself proves the link is alive).
+#[embassy_executor::task]
+async fn heartbeat_task() {
+    let mut announced: Option<bool> = None;
+    loop {
+        Timer::after(Duration::from_secs(HEARTBEAT_INTERVAL_S)).await;
+        if FW_XFER_ACTIVE.load(PersistOrdering::Acquire) {
+            continue;
+        }
+        let up = match wio_request(cmd::PING, &[], HEARTBEAT_TIMEOUT_MS).await {
+            Ok(version) => {
+                vprintln!("heartbeat: wio ack, fw v{}", version);
+                true
+            }
+            Err(_) => {
+                vprintln!("heartbeat: no ack from wio");
+                false
+            }
+        };
+        LINK_UP.store(up, PersistOrdering::Relaxed);
+        if announced != Some(up) {
+            announced = Some(up);
+            if up {
+                println!("wio link up");
+            } else {
+                println!("wio link down (no heartbeat ack)");
+            }
+        }
+    }
+}
+
 /// Handle one complete frame from the WIO.
 fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
+    vprintln!("wio frame: cmd=0x{:02x} len={}", cmd_id, payload.len());
     match cmd_id {
         msg::POSITION => {
             if payload.len() < 3 + packet::POSITION_PACKET_LEN {
@@ -576,6 +633,9 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(link_task(uart_rx, uart_tx))
         .expect("spawn link task");
+    spawner
+        .spawn(heartbeat_task())
+        .expect("spawn heartbeat task");
 
     // USB Serial/JTAG: the console (esp-println) shares its TX; the RX half
     // lets a host push a WIO firmware image straight through the ESP.
