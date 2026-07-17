@@ -30,7 +30,16 @@ cd wio && cargo run --release                 # app, RTT console
 
 # ESP32-C6 (USB Serial/JTAG; console also lives there)
 cd esp && cargo run --release
+
+# bench tool: check over UART whether the WIO is alive (powers the rail,
+# pulses reset, probes factory AT firmware at 9600 and the link PING at
+# 115200; results on the USB console)
+cd esp && cargo run --release --bin wio-probe
 ```
+
+Note the WIO only has power while the ESP drives the LDO enable
+(GPIO2) high - flash the ESP first or SWD/UART on the WIO will see a
+dead chip.
 
 `FW_VERSION=n` at build time stamps the WIO firmware version reported
 over the link (used for update bookkeeping).
@@ -160,4 +169,5 @@ J5 header remains as the recovery path.
 | 1 | GND |
 
 
-
+Inital WIO wipe:
+`openocd -f interface/cmsis-dap.cfg -f target/stm32wlx.cfg -c "init; reset halt; stm32l4x unlock 0; reset halt; exit"`
