@@ -224,6 +224,22 @@ fn revert_partitions(start_page: u32) {
 
 // ── Jump to application ─────────────────────────────────────────────────────
 
+/// RAM bounds for the app's initial stack pointer (64 KB at 0x2000_0000).
+const RAM_START: u32 = 0x2000_0000;
+const RAM_END: u32 = RAM_START + 64 * 1024;
+
+/// Whether the ACTIVE partition holds a plausible vector table: an initial
+/// stack pointer inside RAM and a reset vector inside the ACTIVE flash range
+/// with the Thumb bit set. Guards against jumping into an erased (all-0xFF)
+/// or half-written application, which would fault into a lockup.
+fn app_valid() -> bool {
+    let sp = flash_read_u32(ACTIVE_BASE);
+    let reset = flash_read_u32(ACTIVE_BASE + 4);
+    (RAM_START..=RAM_END).contains(&sp)
+        && (reset & 1) == 1
+        && (ACTIVE_BASE..DFU_BASE).contains(&(reset & !1))
+}
+
 /// Set VTOR and jump to the application in the ACTIVE partition.
 ///
 /// # Safety
@@ -281,6 +297,15 @@ fn main() -> ! {
     }
 
     flash_lock();
+
+    // With no valid application (e.g. the bootloader was just flashed on a
+    // freshly erased chip, before the app), wait quietly for a reflash
+    // instead of jumping into erased flash and locking up.
+    if !app_valid() {
+        loop {
+            cortex_m::asm::wfi();
+        }
+    }
 
     unsafe { jump_to_app() }
 }
