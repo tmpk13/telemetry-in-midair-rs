@@ -171,3 +171,9 @@ J5 header remains as the recovery path.
 
 Inital WIO wipe:
 `openocd -f interface/cmsis-dap.cfg -f target/stm32wlx.cfg -c "init; reset halt; stm32l4x unlock 0; reset halt; exit"`
+
+
+
+# Known Issues
+
+Pin 28 on WIO should be NC
