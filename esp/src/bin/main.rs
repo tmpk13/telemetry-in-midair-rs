@@ -662,9 +662,18 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
     };
 
     let notifier = async {
+        let mut first = true;
         loop {
-            let interval = NOTIFY_INTERVAL_MS.lock(|c| c.get());
-            Timer::after(Duration::from_millis(u64::from(interval))).await;
+            if first {
+                // Push the cached data right away so a fresh central sees
+                // the latest fix/telemetry without waiting an interval
+                // (notify also refreshes the read-property values).
+                first = false;
+                Timer::after(Duration::from_millis(200)).await;
+            } else {
+                let interval = NOTIFY_INTERVAL_MS.lock(|c| c.get());
+                Timer::after(Duration::from_millis(u64::from(interval))).await;
+            }
             // Defer discretionary notifications while the LoRa radio
             // transmits (both radios share the power budget).
             while wio_busy() {
