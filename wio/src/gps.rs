@@ -34,6 +34,12 @@ pub struct Gps {
     updated: bool,
     /// Whether the module was put into backup mode.
     pub sleeping: bool,
+    /// Total bytes read from USART1 since boot (saturating). Presence check:
+    /// 0 means nothing on the wire (unpowered / miswired / RX pin).
+    rx_bytes: u32,
+    /// Total valid NMEA sentences parsed since boot (saturating). >0 means
+    /// the module is talking at the expected baud.
+    rx_sentences: u32,
 }
 
 impl Gps {
@@ -63,12 +69,31 @@ impl Gps {
             packet: PositionPacket::default(),
             updated: false,
             sleeping: false,
+            rx_bytes: 0,
+            rx_sentences: 0,
         }
     }
 
     /// Latest folded position snapshot.
     pub fn packet(&self) -> PositionPacket {
         self.packet
+    }
+
+    /// Bytes read from the module since boot. 0 = nothing on USART1.
+    pub fn rx_bytes(&self) -> u32 {
+        self.rx_bytes
+    }
+
+    /// Valid NMEA sentences parsed since boot.
+    pub fn rx_sentences(&self) -> u32 {
+        self.rx_sentences
+    }
+
+    /// Whether the module has produced at least one valid NMEA sentence,
+    /// i.e. it is powered, wired and talking at the expected baud. A fix is
+    /// a separate question ([`has_fix`](Self::has_fix)).
+    pub fn present(&self) -> bool {
+        self.rx_sentences > 0
     }
 
     /// Whether the position state changed since the last call.
@@ -116,6 +141,7 @@ impl Gps {
                     continue;
                 }
             };
+            self.rx_bytes = self.rx_bytes.saturating_add(1);
             match byte {
                 b'$' => {
                     self.line[0] = b'$';
@@ -124,11 +150,14 @@ impl Gps {
                 }
                 b'\r' | b'\n' => {
                     if self.in_line
-                        && let Ok(s) = core::str::from_utf8(&self.line[..self.len])
-                            && let Some(sentence) = nmea::parse(s) {
+                        && let Ok(s) = core::str::from_utf8(&self.line[..self.len]) {
+                            crate::debug_println!("gps: {}", s);
+                            if let Some(sentence) = nmea::parse(s) {
+                                self.rx_sentences = self.rx_sentences.saturating_add(1);
                                 self.fold(sentence);
                                 self.updated = true;
                             }
+                        }
                     self.in_line = false;
                     self.len = 0;
                 }

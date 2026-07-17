@@ -207,6 +207,14 @@ mod app {
         // While set, we flagged our radio busy to the ESP; clear at this time.
         let mut busy_clear_at: Option<u32> = None;
 
+        // GPS presence: announce the first NMEA sentence, warn once if the
+        // module is still silent after a grace period, and log a periodic
+        // aliveness summary to RTT.
+        let mut gps_nmea_seen = false;
+        let mut gps_checked = false;
+        let gps_grace_until = platform::millis().wrapping_add(5_000);
+        let mut next_gps_log = platform::millis().wrapping_add(5_000);
+
         status_println!(esp, "wio v{} up, node {}", FIRMWARE_VERSION, cfg.address);
 
         loop {
@@ -339,6 +347,32 @@ mod app {
                 } else {
                     status_println!(esp, "gps fix lost");
                 }
+            }
+            // Presence: first sentence, then a one-shot warning if the
+            // module never spoke, then a periodic RTT aliveness line.
+            if !gps_nmea_seen && gps.present() {
+                gps_nmea_seen = true;
+                status_println!(esp, "gps: NMEA up ({} bytes)", gps.rx_bytes());
+            }
+            if !gps_checked && due(now, gps_grace_until) {
+                gps_checked = true;
+                if !gps.present() {
+                    if gps.rx_bytes() == 0 {
+                        status_println!(esp, "gps: silent on USART1 (power/wiring?)");
+                    } else {
+                        status_println!(esp, "gps: {} bytes but no NMEA (baud?)", gps.rx_bytes());
+                    }
+                }
+            }
+            if due(now, next_gps_log) {
+                next_gps_log = now.wrapping_add(5_000);
+                rprintln!(
+                    "gps: bytes={} nmea={} fix={} sats={}",
+                    gps.rx_bytes(),
+                    gps.rx_sentences(),
+                    gps.has_fix() as u8,
+                    gps.packet().sats
+                );
             }
             if gps.take_updated() && due(now, next_esp_pos) {
                 next_esp_pos = now.wrapping_add(1_000);

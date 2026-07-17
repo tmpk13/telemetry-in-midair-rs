@@ -85,11 +85,18 @@ config and WIO firmware images.
 ## Status updates
 
 The WIO-E5 sends human-readable status lines to the ESP over the UART link
-(`msg::LOG`) on notable events - boot, GPS fix acquired/lost, soft
-sleep/wake, config applied, firmware receive. The ESP prints each to its
-USB console (prefixed `wio:`) and notifies it on the status/log
-characteristic, so gps-gui-rs (or any BLE client) sees the same live log.
-Lines are ASCII, up to `link::LOG_MAX` (64) bytes.
+(`msg::LOG`) on notable events - boot, GPS presence (first NMEA / silent
+module), GPS fix acquired/lost, soft sleep/wake, config applied, firmware
+receive. The ESP prints each to its USB console (prefixed `wio:`) and
+notifies it on the status/log characteristic, so gps-gui-rs (or any BLE
+client) sees the same live log. Lines are ASCII, up to `link::LOG_MAX`
+(64) bytes.
+
+The WIO also prints a periodic GPS aliveness line to its own RTT console
+(`gps: bytes=.. nmea=.. fix=.. sats=..`); a silent module (`bytes=0`)
+usually means the ESP-controlled GPS/LoRa rail (GPIO2 LDO) is off rather
+than a dead module. Build the WIO with `--features debug` to also dump
+every raw NMEA line over RTT.
 
 The ESP also pings the WIO (`cmd::PING`) every 3 s as a link heartbeat and
 prints `wio link up` / `wio link down` on transitions, so a crashed or
