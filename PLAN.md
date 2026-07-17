@@ -10,11 +10,15 @@ The WIO-E5 reads from the MAX-M10N-10B over UART. The GPS coordinates will be se
 
 The radio is configured by TOML files that can be stored on the sd card and/or sent over UART by the ESP32C6.
 
-The ESP32C6 communicates over BLE to an external app for configuration. The WIO-E5 and MAX-M10N-10B can be turned off by BLE. The ESP can be put into a sleep over BLE. Waking up on a interval to check for wake over BLE.
+The ESP32C6 communicates over BLE to an external app for configuration. The WIO-E5 and MAX-M10N-10B can be turned off or slept by BLE. The ESP can be put into a sleep over BLE. Waking up on a interval to check for wake over BLE.
 
 The SD Card logs should be readable by a phone or computer.
 
 The WIO-E5 blinks D6 on LORA RX, D5 on LORA TX.
 
 The ESP32C6 blinks D2 very quickly on firmware upload to the WIO. Blinks on sleep wake interval. Blinks quickly on info received from phone.
+
+The SD card is optional to run. The ESP will cache the latest data (LORA RSSI/GPS coords/time). This data will be sent once ble is connected.
+
+Uses `embedded nano mesh` with the WIO-E5 for easy repeater functionality.
 
