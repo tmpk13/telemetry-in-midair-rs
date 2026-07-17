@@ -16,10 +16,14 @@ pub const TELEMETRY_UUID: &str = "c3a10005-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const BULK_UUID: &str = "c3a10006-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 /// Remote position: `[src u8, rssi i16le, PositionPacket 20B]`, notify + read.
 pub const REMOTE_UUID: &str = "c3a10007-9f6e-4b2c-8f5a-2e32c3b1e5d0";
+/// WIO status/log line (ASCII), notify + read. Carries the latest
+/// [`crate::link::msg::LOG`] text, up to [`crate::link::LOG_MAX`] bytes.
+pub const LOG_UUID: &str = "c3a10008-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 
 pub const TELEMETRY_UUID_U128: u128 = 0xc3a10005_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const BULK_UUID_U128: u128 = 0xc3a10006_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const REMOTE_UUID_U128: u128 = 0xc3a10007_9f6e_4b2c_8f5a_2e32c3b1e5d0;
+pub const LOG_UUID_U128: u128 = 0xc3a10008_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
 /// Remote position value length (src + rssi + packet).
 pub const REMOTE_LEN: usize = 1 + 2 + gps_proto::packet::POSITION_PACKET_LEN;
@@ -96,6 +100,7 @@ mod tests {
         assert_eq!(to_u128(super::TELEMETRY_UUID), super::TELEMETRY_UUID_U128);
         assert_eq!(to_u128(super::BULK_UUID), super::BULK_UUID_U128);
         assert_eq!(to_u128(super::REMOTE_UUID), super::REMOTE_UUID_U128);
+        assert_eq!(to_u128(super::LOG_UUID), super::LOG_UUID_U128);
         // Same service as the C3 beacon, different characteristic ids.
         assert!(str_eq(
             gps_proto::packet::SERVICE_UUID,

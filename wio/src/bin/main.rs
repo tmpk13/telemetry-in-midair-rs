@@ -45,7 +45,7 @@ mod app {
     use wio_e5_gps::sdcard::SdCard;
     use wio_e5_gps::sdlog::SdLog;
     use wio_e5_gps::watchdog;
-    use wio_e5_gps::{LoraIo, MeshNode, FIRMWARE_VERSION};
+    use wio_e5_gps::{status_println, LoraIo, MeshNode, FIRMWARE_VERSION};
 
     /// `a` happened at or after deadline `b` in wrapping-u32 time.
     fn due(now: u32, deadline: u32) -> bool {
@@ -191,6 +191,8 @@ mod app {
         let mut sleeping = false;
         let mut tx_count: u32 = 0;
         let mut rx_count: u32 = 0;
+        // Track the GPS fix state so only its transitions are announced.
+        let mut had_fix = false;
 
         // Position report to the ESP at most once a second (the GPS fix
         // rate); the LoRa beacon runs on its own configured interval.
@@ -201,6 +203,8 @@ mod app {
         let mut next_status: u32 = platform::millis().wrapping_add(3_000);
         // While set, we flagged our radio busy to the ESP; clear at this time.
         let mut busy_clear_at: Option<u32> = None;
+
+        status_println!(esp, "wio v{} up, node {}", FIRMWARE_VERSION, cfg.address);
 
         loop {
             let now = platform::millis();
@@ -221,11 +225,11 @@ mod app {
                         if sleep && !sleeping {
                             io.inner().standby();
                             sleeping = true;
-                            rprintln!("Soft sleep");
+                            status_println!(esp, "soft sleep");
                         } else if !sleep && sleeping {
                             io.inner().init(cfg);
                             sleeping = false;
-                            rprintln!("Woke from soft sleep");
+                            status_println!(esp, "woke from soft sleep");
                         }
                         esp.send_ack(cmd::WIO_SLEEP, sleep as u16);
                     }
@@ -263,7 +267,7 @@ mod app {
                                 if !sdlog.write_config(now, cfgxfer.bytes()) {
                                     rprintln!("Config applied; SD save failed");
                                 }
-                                rprintln!("Config applied (address {})", cfg.address);
+                                status_println!(esp, "config applied, node {}", cfg.address);
                                 esp.send_ack(cmd::CFG_END, 0);
                             }
                             Err(_) => esp.send_nak(cmd::CFG_END, link::err::BAD_CONFIG),
@@ -272,7 +276,10 @@ mod app {
                         CfgEvent::Error(e) => esp.send_nak(cmd::CFG_END, e),
                     },
                     cmd::FW_BEGIN => match fw.begin(esp.payload()) {
-                        FwEvent::Ack(seq) => esp.send_ack(cmd::FW_BEGIN, seq),
+                        FwEvent::Ack(seq) => {
+                            status_println!(esp, "fw update: receiving image");
+                            esp.send_ack(cmd::FW_BEGIN, seq);
+                        }
                         FwEvent::Error(e) => esp.send_nak(cmd::FW_BEGIN, e),
                         FwEvent::Complete => unreachable!(),
                     },
@@ -321,6 +328,15 @@ mod app {
 
             // ---- GPS ------------------------------------------------------
             gps.poll();
+            let fix = gps.has_fix();
+            if fix != had_fix {
+                had_fix = fix;
+                if fix {
+                    status_println!(esp, "gps fix acquired ({} sats)", gps.packet().sats);
+                } else {
+                    status_println!(esp, "gps fix lost");
+                }
+            }
             if gps.take_updated() && due(now, next_esp_pos) {
                 next_esp_pos = now.wrapping_add(1_000);
                 let packet = gps.packet();

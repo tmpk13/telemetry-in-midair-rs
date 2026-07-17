@@ -17,6 +17,17 @@ macro_rules! debug_println {
     };
 }
 
+/// Print a status line to RTT and forward it to the ESP over the link
+/// ([`crate::esplink::EspLink::send_status`]), where it reaches the USB
+/// console and BLE. `$esp` is the [`crate::esplink::EspLink`].
+#[macro_export]
+macro_rules! status_println {
+    ($esp:expr, $($arg:tt)*) => {{
+        rtt_target::rprintln!($($arg)*);
+        $esp.send_status(::core::format_args!($($arg)*));
+    }};
+}
+
 pub mod boot_state;
 pub mod cfgxfer;
 pub mod esplink;

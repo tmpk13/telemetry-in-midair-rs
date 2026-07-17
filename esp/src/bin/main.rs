@@ -35,10 +35,11 @@ use core::cell::{Cell, RefCell};
 
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex as AsyncMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_backtrace as _;
@@ -48,6 +49,7 @@ use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart, UartRx, UartTx};
+use esp_hal::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
@@ -130,7 +132,7 @@ struct Persist {
 // These live in RTC fast RAM and are not reinitialized on a deep-sleep
 // wake; the magic word gates cold-boot garbage. esp-hal's Persistable
 // marker only covers atomics and primitives, hence three statics.
-use portable_atomic::{AtomicU32 as PersistU32, Ordering as PersistOrdering};
+use portable_atomic::{AtomicBool, AtomicU32 as PersistU32, Ordering as PersistOrdering};
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static PERSIST_MAGIC_WORD: PersistU32 = PersistU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
@@ -266,6 +268,20 @@ static OUT_CHANNEL: Channel<CriticalSectionRawMutex, OutFrame, 8> = Channel::new
 /// (is_ack, acked cmd, value-or-err) from the last ACK/NAK frame.
 static ACK_SIGNAL: Signal<CriticalSectionRawMutex, (bool, u8, u16)> = Signal::new();
 
+/// Serializes [`wio_request`] so a firmware transfer over USB and a config
+/// write over BLE cannot race for the single [`ACK_SIGNAL`].
+static LINK_LOCK: AsyncMutex<CriticalSectionRawMutex, ()> = AsyncMutex::new(());
+
+/// Set while a bulk transfer (TOML or firmware) owns the WIO link, so the
+/// BLE and USB paths cannot run one at the same time and corrupt the
+/// firmware stream.
+static FW_XFER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Latest WIO status/log lines awaiting delivery to the connected central.
+/// The BLE characteristic value must match [`link::LOG_MAX`].
+const _: () = assert!(link::LOG_MAX == 64);
+static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 64>, 8> = Channel::new();
+
 fn queue_frame(cmd: u8, payload: &[u8]) {
     let mut v = heapless::Vec::new();
     if v.extend_from_slice(payload).is_ok() {
@@ -276,6 +292,9 @@ fn queue_frame(cmd: u8, payload: &[u8]) {
 /// Send a command and wait for the WIO's ACK/NAK. Returns the ack value
 /// or the midair-proto ble ack status to report.
 async fn wio_request(cmd: u8, payload: &[u8], timeout_ms: u64) -> Result<u16, u8> {
+    // Hold the link for the whole request/response so a concurrent caller
+    // cannot consume this call's ACK.
+    let _guard = LINK_LOCK.lock().await;
     ACK_SIGNAL.reset();
     let mut v = heapless::Vec::new();
     v.extend_from_slice(payload).map_err(|_| ble::ACK_BAD_STATE)?;
@@ -331,6 +350,17 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
             // Non-position mesh traffic: just log it on the console.
             println!("lora rx from {} ({} bytes)", payload.first().unwrap_or(&0), payload.len().saturating_sub(3));
         }
+        msg::LOG => {
+            // WIO status line: print to the USB console and hand it to the
+            // BLE session to notify the connected central.
+            let text = core::str::from_utf8(payload).unwrap_or("<non-utf8 status>");
+            println!("wio: {}", text);
+            let mut line = heapless::Vec::new();
+            let n = payload.len().min(link::LOG_MAX);
+            if line.extend_from_slice(&payload[..n]).is_ok() {
+                let _ = LOG_CHANNEL.try_send(line);
+            }
+        }
         link::resp::ACK => {
             if payload.len() >= 3 {
                 let value = u16::from_le_bytes([payload[1], payload[2]]);
@@ -378,6 +408,74 @@ async fn link_task(mut rx: UartRx<'static, Async>, mut tx: UartTx<'static, Async
     }
 }
 
+/// Firmware upload over the USB Serial/JTAG port. A host frames bulk ops
+/// (the same wire format as the BLE bulk characteristic, [`link::usb`]) and
+/// each is run through [`handle_bulk`] into the WIO, the ack framed back.
+/// The console (esp-println) shares the port; the host's frame parser
+/// resyncs past that text by sync byte + CRC.
+#[embassy_executor::task]
+async fn usb_task(mut rx: UsbSerialJtagRx<'static, Async>, mut tx: UsbSerialJtagTx<'static, Async>) {
+    use embedded_io_async::{Read as _, Write as _};
+    let mut parser = FrameParser::new();
+    let mut out = FrameBuf::new();
+    let mut bulk: Option<BulkState> = None;
+    let mut buf = [0u8; 64];
+    loop {
+        // While a transfer is mid-flight, bound the wait so a host that
+        // vanished cannot wedge the shared transfer guard forever.
+        let read = if bulk.is_some() {
+            match with_timeout(Duration::from_secs(5), rx.read(&mut buf)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    bulk = None;
+                    FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
+                    queue_frame(cmd::FW_ABORT, &[]);
+                    queue_frame(cmd::RADIO_BUSY, &[0]);
+                    blink(Blink::Off);
+                    println!("usb: firmware transfer timed out, aborted");
+                    continue;
+                }
+            }
+        } else {
+            rx.read(&mut buf).await
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        for &b in &buf[..n] {
+            if !parser.feed(b) {
+                continue;
+            }
+            // Copy the frame out so the parser (and its borrow) is free
+            // across the awaits below.
+            let cmd_id;
+            let len;
+            let mut p = [0u8; link::MAX_PAYLOAD];
+            {
+                let f = parser.frame();
+                cmd_id = f.cmd;
+                len = f.payload.len();
+                p[..len].copy_from_slice(f.payload);
+            }
+            match cmd_id {
+                link::usb::PING => {
+                    out.build(link::resp::ACK, &[link::usb::PING, 1, 0]);
+                    let _ = tx.write_all(out.as_bytes()).await;
+                    let _ = tx.flush().await;
+                }
+                link::usb::BULK => {
+                    let (ack, alen) = handle_bulk(&p[..len], &mut bulk).await;
+                    out.build(link::usb::BULK_ACK, &ack[..alen]);
+                    let _ = tx.write_all(out.as_bytes()).await;
+                    let _ = tx.flush().await;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BLE
 // ---------------------------------------------------------------------------
@@ -409,6 +507,9 @@ struct GpsService {
     /// Last remote position heard over LoRa: [src, rssi i16le, packet].
     #[characteristic(uuid = ble::REMOTE_UUID_U128, read, notify)]
     remote: [u8; ble::REMOTE_LEN],
+    /// Latest WIO status/log line (ASCII text).
+    #[characteristic(uuid = ble::LOG_UUID_U128, read, notify)]
+    log: heapless::Vec<u8, 64>,
 }
 
 // Default app descriptor required by the esp-idf 2nd-stage bootloader.
@@ -475,6 +576,12 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(link_task(uart_rx, uart_tx))
         .expect("spawn link task");
+
+    // USB Serial/JTAG: the console (esp-println) shares its TX; the RX half
+    // lets a host push a WIO firmware image straight through the ESP.
+    let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
+    let (usb_rx, usb_tx) = usb.split();
+    spawner.spawn(usb_task(usb_rx, usb_tx)).expect("spawn usb task");
 
     let radio = esp_radio::init().expect("radio init");
     let transport =
@@ -622,6 +729,10 @@ struct BulkState {
 
 /// Handle one connection: GATT events plus the notify ticker.
 async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &Server<'_>) {
+    // Drop status lines buffered while disconnected so the central sees
+    // live events, not a stale backlog.
+    while LOG_CHANNEL.try_receive().is_ok() {}
+
     let events = async {
         let mut bulk: Option<BulkState> = None;
         loop {
@@ -655,6 +766,7 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
         // Session over: make sure a dangling transfer does not leave the
         // WIO waiting or the busy flag set.
         if bulk.is_some() {
+            FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
             queue_frame(cmd::FW_ABORT, &[]);
             queue_frame(cmd::RADIO_BUSY, &[0]);
             blink(Blink::Off);
@@ -693,8 +805,18 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
         }
     };
 
-    // Either arm ending (disconnect / notify failure) ends the session.
-    select(events, notifier).await;
+    // Stream WIO status lines to the central as they arrive. Notify errors
+    // are non-fatal (a central that never subscribed just misses them), so
+    // this arm never ends the session on its own.
+    let logger = async {
+        loop {
+            let line = LOG_CHANNEL.receive().await;
+            let _ = server.gps.log.notify(conn, &line).await;
+        }
+    };
+
+    // Any arm ending (disconnect / position-notify failure) ends the session.
+    select3(events, notifier, logger).await;
 }
 
 /// Apply a config write and build the ack to send back.
@@ -799,9 +921,14 @@ async fn handle_bulk(
             let total = u32::from_le_bytes(data[2..6].try_into().unwrap());
             let crc32 = u32::from_le_bytes(data[6..10].try_into().unwrap());
             let version = u16::from_le_bytes(data[10..12].try_into().unwrap());
+            // Claim the WIO link: only one transfer (BLE or USB) at a time.
+            if FW_XFER_ACTIVE.swap(true, PersistOrdering::AcqRel) {
+                return nak(ble::ACK_BAD_STATE);
+            }
             let result = match kind {
                 ble::KIND_TOML => {
                     if total == 0 || total > 1024 {
+                        FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
                         return nak(packet::ACK_BAD_VALUE);
                     }
                     wio_request(cmd::CFG_BEGIN, &(total as u16).to_le_bytes(), 1000).await
@@ -813,7 +940,10 @@ async fn handle_bulk(
                     p[8..10].copy_from_slice(&version.to_le_bytes());
                     wio_request(cmd::FW_BEGIN, &p, 1000).await
                 }
-                _ => return nak(packet::ACK_BAD_VALUE),
+                _ => {
+                    FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
+                    return nak(packet::ACK_BAD_VALUE);
+                }
             };
             match result {
                 Ok(_) => {
@@ -829,7 +959,10 @@ async fn handle_bulk(
                     });
                     packet::encode_ack(ble::ACK_ID_BULK, packet::ACK_OK, &0u32.to_le_bytes())
                 }
-                Err(status) => nak(status),
+                Err(status) => {
+                    FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
+                    nak(status)
+                }
             }
         }
         ble::OP_DATA => {
@@ -875,6 +1008,7 @@ async fn handle_bulk(
                 }
                 Err(status) => {
                     *bulk = None;
+                    FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
                     queue_frame(cmd::RADIO_BUSY, &[0]);
                     blink(Blink::Off);
                     nak(status)
@@ -885,6 +1019,7 @@ async fn handle_bulk(
             let Some(state) = bulk.take() else {
                 return nak(ble::ACK_BAD_STATE);
             };
+            FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
             queue_frame(cmd::RADIO_BUSY, &[0]);
             blink(Blink::Off);
             if state.received != state.total {
@@ -904,6 +1039,7 @@ async fn handle_bulk(
         }
         ble::OP_ABORT => {
             if bulk.take().is_some() {
+                FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
                 queue_frame(cmd::FW_ABORT, &[]);
                 queue_frame(cmd::RADIO_BUSY, &[0]);
                 blink(Blink::Off);

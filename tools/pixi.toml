@@ -1,0 +1,15 @@
+[project]
+name = "midair-tools"
+version = "0.1.0"
+description = "Host tools for the telemetry-in-midair board"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.10"
+pyserial = ">=3.5"
+
+[tasks]
+# Upload a WIO-E5 firmware image through the ESP32-C6 USB port, e.g.:
+#   pixi run fw-upload --file ../wio/wio-e5-gps.bin
+fw-upload = "python wio_fw_upload.py"

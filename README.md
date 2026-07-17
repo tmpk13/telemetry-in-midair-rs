@@ -14,6 +14,7 @@ power. See `PLAN.md` for the intent.
 | `wio/` | WIO-E5 application firmware (RTIC). | `thumbv7em-none-eabi` (nightly) |
 | `wio/bootloader/` | Two-partition swap bootloader for UART-fed firmware updates. | `thumbv7em-none-eabi` |
 | `esp/` | ESP32-C6 firmware (embassy + trouble BLE). | `riscv32imac-unknown-none-elf` (stable) |
+| `tools/` | Host uploader (Python/pixi) to flash the WIO through the ESP USB. | host |
 
 Depends on the sibling repo `../gps-proto` for the BLE position protocol
 and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
@@ -75,8 +76,18 @@ window must exceed one packet's air time.
 Same service UUID as the ESP32-C3 beacon, so gps-gui-rs discovers it
 unchanged (device name `GPS-C6`). On top of the gps-proto position /
 config / ack characteristics the C6 adds telemetry (LoRa RSSI/SNR,
-counters, SD + fix flags), the last remote node position, and a bulk
-write characteristic for TOML config and WIO firmware images.
+counters, SD + fix flags), the last remote node position, a status/log
+characteristic (notify + read), and a bulk write characteristic for TOML
+config and WIO firmware images.
+
+## Status updates
+
+The WIO-E5 sends human-readable status lines to the ESP over the UART link
+(`msg::LOG`) on notable events - boot, GPS fix acquired/lost, soft
+sleep/wake, config applied, firmware receive. The ESP prints each to its
+USB console (prefixed `wio:`) and notifies it on the status/log
+characteristic, so gps-gui-rs (or any BLE client) sees the same live log.
+Lines are ASCII, up to `link::LOG_MAX` (64) bytes.
 
 Config command ids (config characteristic, `[id, len, value]`):
 
@@ -99,15 +110,34 @@ Normal FAT16/32 card. `GPSLOG.CSV` gets one line per own/remote fix
 (`ms,src,lat_e7,lon_e7,alt_dm,speed_cms,course_cdeg,sats,fix,rssi`);
 readable in any spreadsheet. The card is optional and hot-pluggable.
 
-## WIO firmware update over BLE
+## WIO firmware update
 
-Build the app, then push `wio-e5-gps.bin` (objcopy of the ELF) through
-the bulk characteristic (`OP_BEGIN` kind 2 with size/crc32/version,
-`OP_DATA` chunks up to 192 bytes, `OP_END`). The ESP streams it over the
-UART link into the WIO's DFU partition (D2 blinks rapidly); on a verified
-CRC the WIO reboots and the swap bootloader installs it power-fail-safely,
-reverting automatically if the new image never confirms boot. SWD via the
-J5 header remains as the recovery path.
+Build the raw image (objcopy of the ELF):
+
+```sh
+cd wio && cargo objcopy --release -- -O binary wio-e5-gps.bin
+```
+
+Either path streams it over the UART link into the WIO's DFU partition (D2
+blinks rapidly); on a verified CRC the WIO reboots and the swap bootloader
+installs it power-fail-safely, reverting automatically if the new image
+never confirms boot. SWD via the J5 header remains as the recovery path.
+
+**Over BLE:** push the `.bin` through the bulk characteristic (`OP_BEGIN`
+kind 2 with size/crc32/version, `OP_DATA` chunks up to 192 bytes,
+`OP_END`).
+
+**Over the ESP USB:** the same bulk protocol is exposed on the USB
+Serial/JTAG port (framed with the link framing, `link::usb` commands), so a
+computer can flash the WIO through the ESP with no BLE. A host uploader
+lives in `tools/`:
+
+```sh
+cd tools && pixi run fw-upload --file ../wio/wio-e5-gps.bin
+```
+
+The ESP console shares the USB port; the uploader's frame parser resyncs
+past the console text. Only one transfer (BLE or USB) runs at a time.
 
 ## ESP32-C6
 `ESP32-C6-MINI-1U-H4`
@@ -177,3 +207,6 @@ Inital WIO wipe:
 # Known Issues
 
 Pin 28 on WIO should be NC
+SMA footprint
+
+Maybe need a larger capacitor on WIO-E5 input? Check this.

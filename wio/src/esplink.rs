@@ -21,6 +21,22 @@ pub struct EspLink {
     busy_since_ms: Option<u32>,
 }
 
+/// Fixed-size `core::fmt::Write` sink for [`EspLink::send_status`]; silently
+/// drops anything past [`link::LOG_MAX`] so a long line just truncates.
+struct StatusWriter {
+    buf: [u8; link::LOG_MAX],
+    len: usize,
+}
+
+impl core::fmt::Write for StatusWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 impl EspLink {
     pub fn new(
         usart2: pac::USART2,
@@ -102,6 +118,19 @@ impl EspLink {
         p[0] = cmd;
         p[1..3].copy_from_slice(&value.to_le_bytes());
         self.send(link::resp::ACK, &p);
+    }
+
+    /// Send a human-readable status line to the ESP ([`link::msg::LOG`]).
+    /// The text is formatted into a stack buffer and truncated to
+    /// [`link::LOG_MAX`] bytes; the ESP prints it and notifies it over BLE.
+    pub fn send_status(&mut self, args: core::fmt::Arguments) {
+        use core::fmt::Write as _;
+        let mut w = StatusWriter {
+            buf: [0u8; link::LOG_MAX],
+            len: 0,
+        };
+        let _ = w.write_fmt(args);
+        self.send(link::msg::LOG, &w.buf[..w.len]);
     }
 
     pub fn send_nak(&mut self, cmd: u8, err: u8) {

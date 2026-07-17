@@ -73,6 +73,28 @@ pub mod msg {
     /// `[src u8, rssi i16le, payload...]` - a non-position mesh payload,
     /// forwarded verbatim.
     pub const LORA_RX: u8 = 0x43;
+
+    /// `[text: ASCII bytes]` - a human-readable status/log line. The ESP
+    /// prints it to its console and notifies it over BLE (no ACK). Payload
+    /// is at most [`super::LOG_MAX`] bytes.
+    pub const LOG: u8 = 0x44;
+}
+
+/// Host <-> ESP32-C6 commands carried over the ESP's USB Serial/JTAG port,
+/// framed identically to the ESP <-> WIO link. They let a computer push a
+/// WIO firmware image straight through the ESP without BLE.
+pub mod usb {
+    /// Host -> ESP, no payload. ESP answers [`super::resp::ACK`]
+    /// (`[PING, 1, 0]`) so a tool can confirm it found the firmware.
+    pub const PING: u8 = 0x50;
+    /// Host -> ESP, `[bulk op bytes]` - one bulk op in the [`crate::ble`]
+    /// wire format (`OP_BEGIN`/`OP_DATA`/`OP_END`/`OP_ABORT`). The ESP runs
+    /// it through the same path as a BLE bulk write and replies with
+    /// [`BULK_ACK`].
+    pub const BULK: u8 = 0x51;
+    /// ESP -> host, `[id, status, value...]` - the gps-proto ack bytes the
+    /// bulk op produced (status 0 = OK).
+    pub const BULK_ACK: u8 = 0x52;
 }
 
 /// Responses (either direction, follow a command).
@@ -103,6 +125,10 @@ pub const RADIO_BUSY_TIMEOUT_MS: u32 = 3_000;
 /// Data bytes per FW_DATA/CFG_DATA frame. Sized well below [`MAX_PAYLOAD`]
 /// so a frame plus response turnaround stays short at 115200 baud.
 pub const DATA_CHUNK: usize = 192;
+
+/// Maximum bytes in a [`msg::LOG`] status line (and the matching BLE
+/// characteristic value). Longer lines are truncated at the source.
+pub const LOG_MAX: usize = 64;
 
 // -- Telemetry (WIO -> ESP -> BLE) ------------------------------------------
 
