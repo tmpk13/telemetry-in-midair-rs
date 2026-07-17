@@ -90,6 +90,9 @@ mod app {
 
         // 16 MHz for SD SPI throughput; before the monotonic starts.
         platform::raise_sysclk(&mut rcc);
+        // The USARTs are clocked from HSI16 (see EspLink/Gps); enable it
+        // before either UART is created or their first send hangs forever.
+        platform::enable_hsi16(&mut rcc);
         Mono::start(cx.core.SYST, SYSCLK_HZ);
 
         let mut flash = dp.FLASH;

@@ -16,6 +16,19 @@ pub fn raise_sysclk(rcc: &mut pac::RCC) {
     while rcc.cr.read().msirdy().bit_is_clear() {}
 }
 
+/// Enable the 16 MHz HSI oscillator and wait until it is ready.
+///
+/// Both USARTs (GPS on USART1, ESP link on USART2) select HSI16 as their
+/// kernel clock so the baud rate stays exact regardless of the MSI sysclk.
+/// `Uart::new` only selects the source - it does not turn the oscillator
+/// on - so this must run before either UART is created. Without it the
+/// USART kernel clock is dead: `TXE` never asserts and the first blocking
+/// send spins forever (then the watchdog resets the chip).
+pub fn enable_hsi16(rcc: &mut pac::RCC) {
+    rcc.cr.modify(|_, w| w.hsion().set_bit());
+    while rcc.cr.read().hsirdy().is_not_ready() {}
+}
+
 /// Milliseconds since boot (via DWT cycle counter).
 ///
 /// Uses wrapping subtraction to handle the DWT counter rollover (~268 s at
