@@ -86,11 +86,10 @@ impl MeshNode {
             // payloads are truncated at the first null; tagged binary
             // payloads (positions, legacy OTA) carry their own length and
             // must pass through untouched.
-            if !midair_proto::lora::is_binary(&pkt.data) {
-                if let Some(end) = pkt.data.iter().position(|&b| b == 0) {
+            if !midair_proto::lora::is_binary(&pkt.data)
+                && let Some(end) = pkt.data.iter().position(|&b| b == 0) {
                     pkt.data.truncate(end);
                 }
-            }
             MeshMessage {
                 source: pkt.source_device_identifier,
                 data: pkt.data,

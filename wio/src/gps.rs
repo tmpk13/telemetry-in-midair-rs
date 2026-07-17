@@ -123,14 +123,12 @@ impl Gps {
                     self.in_line = true;
                 }
                 b'\r' | b'\n' => {
-                    if self.in_line {
-                        if let Ok(s) = core::str::from_utf8(&self.line[..self.len]) {
-                            if let Some(sentence) = nmea::parse(s) {
+                    if self.in_line
+                        && let Ok(s) = core::str::from_utf8(&self.line[..self.len])
+                            && let Some(sentence) = nmea::parse(s) {
                                 self.fold(sentence);
                                 self.updated = true;
                             }
-                        }
-                    }
                     self.in_line = false;
                     self.len = 0;
                 }

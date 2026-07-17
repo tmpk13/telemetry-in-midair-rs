@@ -202,3 +202,9 @@ impl FwUpdate {
         // Flash locked on drop.
     }
 }
+
+impl Default for FwUpdate {
+    fn default() -> Self {
+        Self::new()
+    }
+}

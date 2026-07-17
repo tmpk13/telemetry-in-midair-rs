@@ -354,12 +354,11 @@ mod app {
                     next_beacon = now.wrapping_add(500);
                 }
             }
-            if let Some(t) = busy_clear_at {
-                if due(now, t) {
+            if let Some(t) = busy_clear_at
+                && due(now, t) {
                     esp.send(msg::RADIO_BUSY, &[0]);
                     busy_clear_at = None;
                 }
-            }
 
             // ---- Mesh -------------------------------------------------------
             mesh.update(io, platform::millis());

@@ -9,7 +9,9 @@ name = "esp32c6-gps"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.1", features = ["esp32c6", "unstable"] }
+# ~1.0: the matched esp-rtos 0.2 / esp-radio 0.17 pair expects esp-hal
+# 1.0.x (1.1 breaks esp-phy / esp-rtos).
+esp-hal = { version = "~1.0", features = ["esp32c6", "unstable"] }
 
 esp-rtos = { version = "0.2.0", features = [
   "embassy",
@@ -53,6 +55,7 @@ esp-radio = { version = "0.17.0", features = [
 trouble-host = { version = "0.5.0", features = ["gatt", "default-packet-pool-mtu-251"] }
 
 critical-section = "1.2.0"
+portable-atomic  = "1"
 static_cell      = "2.1.1"
 
 # Shared BLE protocol + NMEA (same service as the ESP32-C3 beacon).

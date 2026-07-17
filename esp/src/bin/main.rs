@@ -123,51 +123,41 @@ const PFLAG_GPS_SLEEP: u32 = 1 << 2;
 
 #[derive(Clone, Copy)]
 struct Persist {
-    magic: u32,
     sleep_interval_s: u32,
     flags: u32,
 }
 
-struct PersistCell(core::cell::UnsafeCell<Persist>);
-unsafe impl Sync for PersistCell {}
-
-/// Lives in RTC fast RAM and is not reinitialized on deep-sleep wake; the
-/// magic word gates cold-boot garbage. Only touched through
-/// [`persist_get`]/[`persist_update`] (critical sections).
+// These live in RTC fast RAM and are not reinitialized on a deep-sleep
+// wake; the magic word gates cold-boot garbage. esp-hal's Persistable
+// marker only covers atomics and primitives, hence three statics.
+use portable_atomic::{AtomicU32 as PersistU32, Ordering as PersistOrdering};
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
-static PERSIST: PersistCell = PersistCell(core::cell::UnsafeCell::new(Persist {
-    magic: 0,
-    sleep_interval_s: 0,
-    flags: 0,
-}));
+static PERSIST_MAGIC_WORD: PersistU32 = PersistU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static PERSIST_INTERVAL: PersistU32 = PersistU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static PERSIST_FLAGS: PersistU32 = PersistU32::new(0);
 
 fn persist_get() -> Persist {
-    critical_section::with(|_| {
-        let p = unsafe { &*PERSIST.0.get() };
-        if p.magic == PERSIST_MAGIC {
-            *p
-        } else {
-            Persist {
-                magic: PERSIST_MAGIC,
-                sleep_interval_s: 0,
-                flags: 0,
-            }
+    if PERSIST_MAGIC_WORD.load(PersistOrdering::Relaxed) == PERSIST_MAGIC {
+        Persist {
+            sleep_interval_s: PERSIST_INTERVAL.load(PersistOrdering::Relaxed),
+            flags: PERSIST_FLAGS.load(PersistOrdering::Relaxed),
         }
-    })
+    } else {
+        Persist {
+            sleep_interval_s: 0,
+            flags: 0,
+        }
+    }
 }
 
 fn persist_update(f: impl FnOnce(&mut Persist)) {
-    critical_section::with(|_| {
-        let p = unsafe { &mut *PERSIST.0.get() };
-        if p.magic != PERSIST_MAGIC {
-            *p = Persist {
-                magic: PERSIST_MAGIC,
-                sleep_interval_s: 0,
-                flags: 0,
-            };
-        }
-        f(p);
-    });
+    let mut p = persist_get();
+    f(&mut p);
+    PERSIST_INTERVAL.store(p.sleep_interval_s, PersistOrdering::Relaxed);
+    PERSIST_FLAGS.store(p.flags, PersistOrdering::Relaxed);
+    PERSIST_MAGIC_WORD.store(PERSIST_MAGIC, PersistOrdering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,11 +337,10 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
                 ACK_SIGNAL.signal((true, payload[0], value));
             }
         }
-        link::resp::NAK => {
-            if payload.len() >= 2 {
+        link::resp::NAK
+            if payload.len() >= 2 => {
                 ACK_SIGNAL.signal((false, payload[0], payload[1] as u16));
             }
-        }
         _ => {}
     }
 }
@@ -430,7 +419,8 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 66320);
+    // The C6's reclaimed boot-RAM region is exactly 64 KiB.
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -438,8 +428,10 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
     let persist = persist_get();
-    let woke_from_sleep =
-        esp_hal::system::wakeup_cause() != esp_hal::system::SleepSource::Undefined;
+    let woke_from_sleep = matches!(
+        esp_hal::system::wakeup_cause(),
+        esp_hal::system::SleepSource::Timer
+    );
 
     // Power rail first so the WIO/GPS state matches what was configured
     // before the deep sleep; then release the deep-sleep pad holds.

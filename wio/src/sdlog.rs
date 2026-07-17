@@ -223,9 +223,9 @@ impl SdLog {
         let mut line = [0u8; 96];
         let mut w = Buf(&mut line, 0);
         let fix = (p.flags & FLAG_FIX != 0) as u8;
-        if write!(
+        if writeln!(
             w,
-            "{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{}",
             now_ms, src, p.lat_e7, p.lon_e7, p.alt_dm, p.speed_cms, p.course_cdeg, p.sats, fix, rssi
         )
         .is_err()

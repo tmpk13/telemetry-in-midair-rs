@@ -115,3 +115,9 @@ impl CfgTransfer {
         CfgEvent::Complete
     }
 }
+
+impl Default for CfgTransfer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
