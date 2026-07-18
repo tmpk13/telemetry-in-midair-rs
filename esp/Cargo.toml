@@ -16,9 +16,9 @@ path = "./src/bin/wio_probe.rs"
 
 [features]
 default = []
-# Extra console logging: every WIO link frame and each heartbeat ping
-# (link up/down transitions are always logged). Build with
-# `cargo run --release --features verbose`.
+# Extra console logging: every WIO link frame, decoded GPS position /
+# remote / telemetry, and each heartbeat ping (link up/down transitions
+# are always logged). Build with `cargo run --release --features verbose`.
 verbose = []
 
 [dependencies]

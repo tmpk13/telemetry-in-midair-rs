@@ -381,9 +381,31 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
             let src = payload[0];
             if src == 0 {
                 if let Some(p) = PositionPacket::decode(&payload[3..]) {
+                    vprintln!(
+                        "wio gps: fix={} sats={} lat_e7={} lon_e7={} alt_dm={} spd_cms={} tod={}ms",
+                        (p.flags & packet::FLAG_FIX != 0) as u8,
+                        p.sats,
+                        p.lat_e7,
+                        p.lon_e7,
+                        p.alt_dm,
+                        p.speed_cms,
+                        p.tod_ms
+                    );
                     GPS_STATE.lock(|c| c.set(p));
                 }
             } else {
+                let rssi = i16::from_le_bytes([payload[1], payload[2]]);
+                if let Some(p) = PositionPacket::decode(&payload[3..]) {
+                    vprintln!(
+                        "wio remote node {}: rssi={} fix={} sats={} lat_e7={} lon_e7={}",
+                        src,
+                        rssi,
+                        (p.flags & packet::FLAG_FIX != 0) as u8,
+                        p.sats,
+                        p.lat_e7,
+                        p.lon_e7
+                    );
+                }
                 let mut buf = [0u8; ble::REMOTE_LEN];
                 buf.copy_from_slice(&payload[..ble::REMOTE_LEN]);
                 REMOTE_STATE.lock(|c| c.set(buf));
@@ -391,6 +413,16 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
         }
         msg::STATUS => {
             if let Some(t) = Telemetry::decode(payload) {
+                vprintln!(
+                    "wio telem: sats={} fix={} rssi={} snr_cb={} rx={} tx={} flags=0x{:02x}",
+                    t.sats,
+                    (t.flags & link::TELEM_FLAG_GPS_FIX != 0) as u8,
+                    t.last_rssi,
+                    t.last_snr_cb,
+                    t.rx_count,
+                    t.tx_count,
+                    t.flags
+                );
                 TELEM_STATE.lock(|c| c.set(t));
             }
         }
