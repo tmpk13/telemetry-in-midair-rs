@@ -10,6 +10,8 @@ python = ">=3.10"
 pyserial = ">=3.5"
 
 [tasks]
-# Upload a WIO-E5 firmware image through the ESP32-C6 USB port, e.g.:
-#   pixi run fw-upload --file ../wio/wio-e5-gps.bin
+# Upload a WIO-E5 firmware image through the ESP32-C6 USB port. The image
+# (../wio/wio-e5-gps.bin) and ESP port are auto-detected:
+#   pixi run fw-upload
+# Override with --file / --port as needed.
 fw-upload = "python wio_fw_upload.py"

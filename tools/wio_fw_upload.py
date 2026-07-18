@@ -12,9 +12,11 @@ Build the image first:
 
     cd wio && cargo objcopy --release -- -O binary wio-e5-gps.bin
 
-Then:
+Then (the image path and ESP port are both auto-detected):
 
-    pixi run fw-upload --file ../wio/wio-e5-gps.bin
+    pixi run fw-upload
+
+or point it elsewhere with --file / --port.
 
 The ESP console shares this port, so its text is interleaved with the reply
 frames; the frame parser here resyncs past it by sync byte and CRC.
@@ -24,9 +26,15 @@ import argparse
 import sys
 import time
 import zlib
+from pathlib import Path
 
 import serial
 from serial.tools import list_ports
+
+# Canonical WIO image: the objcopy output built in ../wio, resolved relative
+# to this script so `pixi run fw-upload` works from any CWD.
+#   cd wio && cargo objcopy --release -- -O binary wio-e5-gps.bin
+DEFAULT_IMAGE = Path(__file__).resolve().parent.parent / "wio" / "wio-e5-gps.bin"
 
 # -- Wire protocol constants (mirror of proto/src/link.rs and ble.rs) --------
 
@@ -163,11 +171,22 @@ def ping(ser: serial.Serial) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--file", required=True, help="WIO firmware .bin (objcopy output)")
+    ap.add_argument(
+        "--file",
+        type=Path,
+        default=DEFAULT_IMAGE,
+        help=f"WIO firmware .bin (objcopy output); default {DEFAULT_IMAGE}",
+    )
     ap.add_argument("--port", help="serial port (auto-detected if omitted)")
     ap.add_argument("--version", type=int, default=1, help="firmware version stamp (0-65535)")
     args = ap.parse_args()
 
+    if not args.file.is_file():
+        sys.exit(
+            f"firmware image not found: {args.file}\n"
+            "build it first: cd wio && cargo objcopy --release -- -O binary wio-e5-gps.bin"
+        )
+    print(f"image file: {args.file}")
     with open(args.file, "rb") as f:
         image = f.read()
     total = len(image)
