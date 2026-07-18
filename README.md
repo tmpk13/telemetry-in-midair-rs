@@ -68,10 +68,27 @@ lifetime = 2               # broadcast hop count; >=2 repeats (2)
 
 [beacon]
 interval_s = 10            # position broadcast period, 0 = off (10)
+
+[gps]                       # MAX-M10 receiver (UBX-CFG-VALSET, RAM layer)
+gps_enabled = true         # (true)
+glonass_enabled = false    # (false); M10 tracks a limited concurrent set
+galileo_enabled = true     # (true)
+beidou_enabled = true      # (true)
+qzss_enabled = true        # (true)
+sbas_enabled = true        # (true)
+power_mode = "full"        # full|psmoo|psmct (full)
+meas_rate_ms = 1000        # measurement/nav period, 25-10000 (1000)
+dynamic_model = "portable" # portable|stationary|pedestrian|automotive|
+                           #   sea|airborne1g|airborne2g|airborne4g (portable)
 ```
 
 Raise `listen_ms` together with slow presets (SF12 etc.) - the listen
 window must exceed one packet's air time.
+
+The `[gps]` settings are pushed to the module as a single UBX-CFG-VALSET at
+boot and again whenever a new config is applied (constellation, power and
+model changes take effect live). Defaults match the M10 factory set, so an
+absent section is a no-op.
 
 ## BLE
 

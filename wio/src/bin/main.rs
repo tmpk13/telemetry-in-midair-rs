@@ -148,13 +148,17 @@ mod app {
         let (esp_rx_prod, esp_rx_cons) = cx.local.esp_rx_q.split();
 
         // GPS on USART1, ESP link on USART2, activity LEDs.
-        let (gps, esp, leds) = cortex_m::interrupt::free(|cs| {
+        let (mut gps, esp, leds) = cortex_m::interrupt::free(|cs| {
             (
                 Gps::new(dp.USART1, gpiob.b6, gpiob.b7, gpiob.b10, &mut rcc, cs),
                 EspLink::new(dp.USART2, gpioa.a2, gpioa.a3, &mut rcc, cs, esp_rx_cons),
                 Leds::new(gpioa.a9, gpioa.a10, cs),
             )
         });
+
+        // The rail was just powered; the module is at factory 9600, matching
+        // gps::BAUD, so push the configured GNSS/power settings now.
+        gps.configure(&cfg.gps);
 
         let io = LoraIo::new(radio);
         let mesh = MeshNode::new(cfg.address, cfg.listen_ms);
@@ -282,10 +286,15 @@ mod app {
                             Ok(new_cfg) => {
                                 let remesh = new_cfg.address != cfg.address
                                     || new_cfg.listen_ms != cfg.listen_ms;
+                                let regps = new_cfg.gps != cfg.gps;
                                 *cfg = new_cfg;
                                 io.inner().init(cfg);
                                 if remesh {
                                     *mesh = MeshNode::new(cfg.address, cfg.listen_ms);
+                                }
+                                if regps && !gps.sleeping {
+                                    gps.configure(&cfg.gps);
+                                    status_println!(esp, "gps reconfigured");
                                 }
                                 *cfg_loaded = true;
                                 // Best effort - the SD card is optional.

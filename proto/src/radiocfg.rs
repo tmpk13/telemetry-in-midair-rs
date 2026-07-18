@@ -26,6 +26,101 @@
 //! interval_s = 10           # position broadcast period
 //! ```
 
+/// GPS receiver power mode (u-blox M10 `CFG-PM-OPERATEMODE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerMode {
+    /// Continuous tracking, lowest fix latency.
+    Full,
+    /// Power-save on/off: acquire a fix, then power down until the next
+    /// update period.
+    PsmOnOff,
+    /// Power-save cyclic tracking: stays in a reduced-power tracking loop.
+    PsmCyclic,
+}
+
+impl PowerMode {
+    /// `CFG-PM-OPERATEMODE` enum value.
+    pub fn operate_mode(self) -> u8 {
+        match self {
+            PowerMode::Full => 0,
+            PowerMode::PsmOnOff => 1,
+            PowerMode::PsmCyclic => 2,
+        }
+    }
+}
+
+/// GPS navigation dynamic model (u-blox M10 `CFG-NAVSPG-DYNMODEL`). Only the
+/// subset useful for this tracker is exposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynModel {
+    Portable,
+    Stationary,
+    Pedestrian,
+    Automotive,
+    Sea,
+    /// Airborne with < 1 g acceleration.
+    Airborne1g,
+    /// Airborne with < 2 g acceleration.
+    Airborne2g,
+    /// Airborne with < 4 g acceleration.
+    Airborne4g,
+}
+
+impl DynModel {
+    /// `CFG-NAVSPG-DYNMODEL` enum value.
+    pub fn dynmodel(self) -> u8 {
+        match self {
+            DynModel::Portable => 0,
+            DynModel::Stationary => 2,
+            DynModel::Pedestrian => 3,
+            DynModel::Automotive => 4,
+            DynModel::Sea => 5,
+            DynModel::Airborne1g => 6,
+            DynModel::Airborne2g => 7,
+            DynModel::Airborne4g => 8,
+        }
+    }
+}
+
+/// GPS receiver configuration (u-blox M10, applied via UBX-CFG-VALSET).
+///
+/// The constellation and power defaults match the M10 factory set, so an
+/// absent `[gps]` section leaves the module at its out-of-box behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpsConfig {
+    pub gps_enabled: bool,
+    pub glonass_enabled: bool,
+    pub galileo_enabled: bool,
+    pub beidou_enabled: bool,
+    pub qzss_enabled: bool,
+    pub sbas_enabled: bool,
+    /// Receiver power mode.
+    pub power_mode: PowerMode,
+    /// Measurement period in milliseconds (25-10000, i.e. 40 Hz down to
+    /// 0.1 Hz). The nav solution runs at the same rate.
+    pub meas_rate_ms: u16,
+    /// Navigation dynamic model.
+    pub dyn_model: DynModel,
+}
+
+impl Default for GpsConfig {
+    fn default() -> Self {
+        Self {
+            gps_enabled: true,
+            // GLONASS is off in the M10 default concurrent set (GPS +
+            // Galileo + BeiDou + QZSS + SBAS).
+            glonass_enabled: false,
+            galileo_enabled: true,
+            beidou_enabled: true,
+            qzss_enabled: true,
+            sbas_enabled: true,
+            power_mode: PowerMode::Full,
+            meas_rate_ms: 1000,
+            dyn_model: DynModel::Portable,
+        }
+    }
+}
+
 /// Parsed and validated radio configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RadioConfig {
@@ -47,6 +142,8 @@ pub struct RadioConfig {
     pub lifetime: u8,
     /// Position broadcast interval in seconds (0 disables the beacon).
     pub beacon_interval_s: u16,
+    /// GPS receiver configuration.
+    pub gps: GpsConfig,
 }
 
 impl Default for RadioConfig {
@@ -62,6 +159,7 @@ impl Default for RadioConfig {
             // 2 hops so any node also acts as a repeater by default.
             lifetime: 2,
             beacon_interval_s: 10,
+            gps: GpsConfig::default(),
         }
     }
 }
@@ -203,6 +301,41 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 }
                 cfg.beacon_interval_s = v as u16;
             }
+            // -- [gps] ------------------------------------------------------
+            "gps_enabled" => cfg.gps.gps_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            "glonass_enabled" => cfg.gps.glonass_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            "galileo_enabled" => cfg.gps.galileo_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            "beidou_enabled" => cfg.gps.beidou_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            "qzss_enabled" => cfg.gps.qzss_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            "sbas_enabled" => cfg.gps.sbas_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            "power_mode" => {
+                cfg.gps.power_mode = match unquote(value) {
+                    "full" => PowerMode::Full,
+                    "psmoo" | "psm_onoff" => PowerMode::PsmOnOff,
+                    "psmct" | "psm_cyclic" => PowerMode::PsmCyclic,
+                    _ => return Err(ConfigError::BadValue(lineno)),
+                };
+            }
+            "meas_rate_ms" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                if !(25..=10_000).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.gps.meas_rate_ms = v as u16;
+            }
+            "dynamic_model" | "dyn_model" => {
+                cfg.gps.dyn_model = match unquote(value) {
+                    "portable" => DynModel::Portable,
+                    "stationary" => DynModel::Stationary,
+                    "pedestrian" => DynModel::Pedestrian,
+                    "automotive" => DynModel::Automotive,
+                    "sea" => DynModel::Sea,
+                    "airborne1g" => DynModel::Airborne1g,
+                    "airborne2g" => DynModel::Airborne2g,
+                    "airborne4g" => DynModel::Airborne4g,
+                    _ => return Err(ConfigError::BadValue(lineno)),
+                };
+            }
             _ => {} // unknown key: ignore
         }
     }
@@ -238,6 +371,24 @@ fn parse_i64(s: &str) -> Option<i64> {
     };
     let v = parse_u64(digits)? as i64;
     Some(if neg { -v } else { v })
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Strip matching single or double quotes from a TOML string value.
+fn unquote(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +453,46 @@ mod tests {
         assert!(cfg.ldro());
         cfg.spreading_factor = 10;
         assert!(!cfg.ldro());
+    }
+
+    #[test]
+    fn gps_defaults_when_section_absent() {
+        assert_eq!(parse("frequency_hz = 915000000").unwrap().gps, GpsConfig::default());
+    }
+
+    #[test]
+    fn gps_section() {
+        let toml = r#"
+            [gps]
+            gps_enabled = true
+            glonass_enabled = true
+            galileo_enabled = false
+            beidou_enabled = false
+            qzss_enabled = false
+            sbas_enabled = false
+            power_mode = "psmoo"
+            meas_rate_ms = 500
+            dynamic_model = "airborne2g"
+        "#;
+        let g = parse(toml).unwrap().gps;
+        assert!(g.gps_enabled);
+        assert!(g.glonass_enabled);
+        assert!(!g.galileo_enabled);
+        assert!(!g.sbas_enabled);
+        assert_eq!(g.power_mode, PowerMode::PsmOnOff);
+        assert_eq!(g.power_mode.operate_mode(), 1);
+        assert_eq!(g.meas_rate_ms, 500);
+        assert_eq!(g.dyn_model, DynModel::Airborne2g);
+        assert_eq!(g.dyn_model.dynmodel(), 7);
+    }
+
+    #[test]
+    fn rejects_bad_gps_input() {
+        assert_eq!(parse("gps_enabled = maybe"), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("power_mode = \"turbo\""), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("dynamic_model = spaceship"), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("meas_rate_ms = 10"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("meas_rate_ms = 20000"), Err(ConfigError::OutOfRange(1)));
     }
 
     #[test]

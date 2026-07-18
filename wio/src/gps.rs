@@ -9,6 +9,7 @@
 use cortex_m::interrupt::CriticalSection;
 use gps_proto::nmea::{self, Sentence};
 use gps_proto::packet::{PositionPacket, FLAG_FIX};
+use midair_proto::radiocfg::GpsConfig;
 use stm32wlxx_hal::{
     embedded_hal::serial::{Read, Write},
     gpio::{pins, Output, OutputArgs, PinState},
@@ -21,6 +22,23 @@ pub const BAUD: u32 = 9_600;
 
 /// Longest NMEA sentence: 82 characters including "$" and CRLF.
 const NMEA_MAX: usize = 82;
+
+/// Largest UBX payload this driver builds. The CFG-VALSET frame it emits
+/// (4-byte header + nine key/value pairs) is well under this.
+const UBX_MAX_PAYLOAD: usize = 64;
+
+// UBX-CFG-VALSET configuration keys (u-blox M10, protocol 34.x). The high
+// nibble region encodes the value size: 0x10.. = L (1 byte), 0x20.. = U1/E1
+// (1 byte), 0x30.. = U2 (2 bytes).
+const CFG_SIGNAL_GPS_ENA: u32 = 0x1031_001F;
+const CFG_SIGNAL_SBAS_ENA: u32 = 0x1031_0020;
+const CFG_SIGNAL_GAL_ENA: u32 = 0x1031_0021;
+const CFG_SIGNAL_BDS_ENA: u32 = 0x1031_0022;
+const CFG_SIGNAL_QZSS_ENA: u32 = 0x1031_0024;
+const CFG_SIGNAL_GLO_ENA: u32 = 0x1031_0025;
+const CFG_PM_OPERATEMODE: u32 = 0x20D0_0001;
+const CFG_RATE_MEAS: u32 = 0x3021_0001;
+const CFG_NAVSPG_DYNMODEL: u32 = 0x2011_0021;
 
 pub struct Gps {
     uart: Uart1<pins::B7, pins::B6>,
@@ -217,32 +235,79 @@ impl Gps {
         let _ = nb::block!(self.uart.flush());
     }
 
+    /// Frame and send a UBX message: `B5 62 class id len_lo len_hi payload
+    /// ck_a ck_b`, with the 8-bit Fletcher checksum over class..payload.
+    /// Payloads longer than [`UBX_MAX_PAYLOAD`] are dropped (never happens
+    /// for the frames this driver builds).
+    fn ubx(&mut self, class: u8, id: u8, payload: &[u8]) {
+        if payload.len() > UBX_MAX_PAYLOAD {
+            return;
+        }
+        let mut frame = [0u8; 8 + UBX_MAX_PAYLOAD];
+        frame[0] = 0xB5;
+        frame[1] = 0x62;
+        frame[2] = class;
+        frame[3] = id;
+        frame[4] = payload.len() as u8;
+        frame[5] = (payload.len() >> 8) as u8;
+        frame[6..6 + payload.len()].copy_from_slice(payload);
+        let (mut ck_a, mut ck_b) = (0u8, 0u8);
+        for &b in &frame[2..6 + payload.len()] {
+            ck_a = ck_a.wrapping_add(b);
+            ck_b = ck_b.wrapping_add(ck_a);
+        }
+        frame[6 + payload.len()] = ck_a;
+        frame[7 + payload.len()] = ck_b;
+        self.write_all(&frame[..8 + payload.len()]);
+    }
+
+    /// Apply a [`GpsConfig`] with a single UBX-CFG-VALSET (RAM layer). The
+    /// WIO controls the module's power rail, so it re-runs at every boot;
+    /// the RAM layer is enough and avoids wearing battery-backed storage.
+    /// No-op while the module is in backup mode.
+    pub fn configure(&mut self, cfg: &GpsConfig) {
+        if self.sleeping {
+            return;
+        }
+        // VALSET payload: version(0), layers(bit0 = RAM), reserved[2], then
+        // key/value pairs. Value width is encoded in the key id (bits 30:28:
+        // 0x1 = 1 byte, 0x3 = 2 bytes).
+        let mut p = [0u8; UBX_MAX_PAYLOAD];
+        let mut n = 0usize;
+        p[1] = 0x01; // layers = RAM
+        n += 4;
+        let mut put = |key: u32, val: &[u8]| {
+            p[n..n + 4].copy_from_slice(&key.to_le_bytes());
+            n += 4;
+            p[n..n + val.len()].copy_from_slice(val);
+            n += val.len();
+        };
+        // CFG-SIGNAL-*_ENA (L, 1 byte): constellation enables.
+        put(CFG_SIGNAL_GPS_ENA, &[cfg.gps_enabled as u8]);
+        put(CFG_SIGNAL_SBAS_ENA, &[cfg.sbas_enabled as u8]);
+        put(CFG_SIGNAL_GAL_ENA, &[cfg.galileo_enabled as u8]);
+        put(CFG_SIGNAL_BDS_ENA, &[cfg.beidou_enabled as u8]);
+        put(CFG_SIGNAL_QZSS_ENA, &[cfg.qzss_enabled as u8]);
+        put(CFG_SIGNAL_GLO_ENA, &[cfg.glonass_enabled as u8]);
+        // CFG-PM-OPERATEMODE (E1, 1 byte).
+        put(CFG_PM_OPERATEMODE, &[cfg.power_mode.operate_mode()]);
+        // CFG-RATE-MEAS (U2, 2 bytes, ms).
+        put(CFG_RATE_MEAS, &cfg.meas_rate_ms.to_le_bytes());
+        // CFG-NAVSPG-DYNMODEL (E1, 1 byte).
+        put(CFG_NAVSPG_DYNMODEL, &[cfg.dyn_model.dynmodel()]);
+        self.ubx(0x06, 0x8A, &p[..n]);
+    }
+
     /// Put the module into backup mode (UBX-RXM-PMREQ, indefinite, wake
     /// on EXTINT or UART RX activity).
     pub fn sleep(&mut self) {
         // Version-0 16-byte payload: version, reserved[3], duration (0 =
         // until wake source), flags (bit1 = backup), wakeupSources
         // (bit3 = uartrx, bit5 = extint0).
-        let mut frame = [0u8; 8 + 16];
-        frame[0] = 0xB5;
-        frame[1] = 0x62;
-        frame[2] = 0x02; // class RXM
-        frame[3] = 0x41; // id PMREQ
-        frame[4] = 16; // length lo
-        frame[5] = 0;
-        // payload[0..4]: version + reserved = 0
-        // payload[4..8]: duration = 0
-        frame[6 + 8..6 + 12].copy_from_slice(&2u32.to_le_bytes()); // flags: backup
-        frame[6 + 12..6 + 16].copy_from_slice(&((1u32 << 3) | (1u32 << 5)).to_le_bytes());
-        // 8-bit Fletcher checksum over class..payload.
-        let (mut ck_a, mut ck_b) = (0u8, 0u8);
-        for &b in &frame[2..6 + 16] {
-            ck_a = ck_a.wrapping_add(b);
-            ck_b = ck_b.wrapping_add(ck_a);
-        }
-        frame[6 + 16] = ck_a;
-        frame[7 + 16] = ck_b;
-        self.write_all(&{ frame });
+        let mut payload = [0u8; 16];
+        payload[8..12].copy_from_slice(&2u32.to_le_bytes()); // flags: backup
+        payload[12..16].copy_from_slice(&((1u32 << 3) | (1u32 << 5)).to_le_bytes());
+        self.ubx(0x02, 0x41, &payload); // class RXM, id PMREQ
         self.extint.set_level_low();
         self.sleeping = true;
         self.packet.flags &= !FLAG_FIX;
