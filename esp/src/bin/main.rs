@@ -1108,24 +1108,37 @@ async fn handle_bulk(
             }
         }
         ble::OP_END => {
-            let Some(state) = bulk.take() else {
-                return nak(ble::ACK_BAD_STATE);
+            // Inspect without consuming: a WIO timeout must leave the state
+            // intact so the host can retry OP_END and reach the WIO again.
+            let (received, total, kind, crc32) = match bulk.as_ref() {
+                Some(s) => (s.received, s.total, s.kind, s.crc32),
+                None => return nak(ble::ACK_BAD_STATE),
             };
-            FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
-            queue_frame(cmd::RADIO_BUSY, &[0]);
-            blink(Blink::Off);
-            if state.received != state.total {
+            let finish = |bulk: &mut Option<BulkState>| {
+                *bulk = None;
+                FW_XFER_ACTIVE.store(false, PersistOrdering::Release);
+                queue_frame(cmd::RADIO_BUSY, &[0]);
+                blink(Blink::Off);
+            };
+            if received != total {
+                finish(bulk);
                 return nak(packet::ACK_BAD_VALUE);
             }
-            let result = if state.kind == ble::KIND_FIRMWARE {
+            let result = if kind == ble::KIND_FIRMWARE {
                 // CRC check over 112 KB of flash takes a moment.
                 wio_request(cmd::FW_END, &[], 5000).await
             } else {
-                wio_request(cmd::CFG_END, &state.crc32.to_le_bytes(), 2000).await
+                wio_request(cmd::CFG_END, &crc32.to_le_bytes(), 2000).await
             };
             println!("bulk: end -> {:?}", result);
             match result {
-                Ok(_) => packet::encode_ack(ble::ACK_ID_BULK, packet::ACK_OK, &[]),
+                Ok(_) => {
+                    finish(bulk);
+                    packet::encode_ack(ble::ACK_ID_BULK, packet::ACK_OK, &[])
+                }
+                // Keep the transfer state + busy flag so a retried OP_END can
+                // try the WIO again (the usb/BLE idle path clears it if the
+                // host vanishes).
                 Err(status) => nak(status),
             }
         }

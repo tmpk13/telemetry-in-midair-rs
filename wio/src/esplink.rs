@@ -129,6 +129,17 @@ impl EspLink {
         let _ = nb::block!(Write::flush(&mut self.uart));
     }
 
+    /// Block until the transmitter has fully shifted out the last byte (the
+    /// TC flag). The HAL's `flush` only waits for the line to be idle, not
+    /// for TX to complete, so a `sys_reset` immediately after a send would
+    /// truncate the frame on the wire; call this in between.
+    pub fn flush_tx(&self) {
+        // Exclusive read of USART2 status; the pins are owned by `self.uart`.
+        unsafe {
+            while (*pac::USART2::PTR).isr.read().tc().bit_is_clear() {}
+        }
+    }
+
     pub fn send_ack(&mut self, cmd: u8, value: u16) {
         let mut p = [0u8; 3];
         p[0] = cmd;

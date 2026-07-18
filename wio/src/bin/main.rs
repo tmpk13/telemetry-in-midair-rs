@@ -330,6 +330,10 @@ mod app {
                         match fw.end(flash) {
                             FwEvent::Complete => {
                                 esp.send_ack(cmd::FW_END, 0);
+                                // Let the ack fully leave the UART before we
+                                // reset, or the ESP never sees it and reports
+                                // a timeout even though the swap is committed.
+                                esp.flush_tx();
                                 rprintln!("Rebooting into bootloader for swap");
                                 cortex_m::peripheral::SCB::sys_reset();
                             }

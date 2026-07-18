@@ -78,6 +78,10 @@ MAX_FW_SIZE = 56 * 2048
 # Espressif USB vendor id, used to auto-detect the port.
 ESPRESSIF_VID = 0x303A
 
+# How many times to retry a bulk op before giving up (transport hiccups and,
+# for OP_END, WIO-side link timeouts).
+ATTEMPTS = 10
+
 
 def crc8(data: bytes) -> int:
     """CRC-8/ITU (poly 0x07, init 0) over the given bytes."""
@@ -133,16 +137,34 @@ class FrameParser:
 
 
 def read_frame(ser: serial.Serial, wanted: set, timeout: float):
-    """Read until a frame whose cmd is in `wanted` arrives, or timeout."""
+    """Read until a frame whose cmd is in `wanted` arrives, or timeout.
+
+    Returns (frame_or_None, info). `info` describes what was seen while
+    waiting - bytes read, any other frames, and a sample of console text -
+    so a caller can explain *why* it is retrying instead of just "no ack".
+    """
     parser = FrameParser()
     deadline = time.monotonic() + timeout
+    nbytes = 0
+    others: list[int] = []
+    text = bytearray()
     while time.monotonic() < deadline:
         chunk = ser.read(64)
+        nbytes += len(chunk)
         for byte in chunk:
             got = parser.feed(byte)
-            if got and got[0] in wanted:
-                return got
-    return None
+            if got is not None:
+                if got[0] in wanted:
+                    return got, ""
+                others.append(got[0])
+            elif 32 <= byte < 127 and len(text) < 96:
+                text.append(byte)
+    info = f"{nbytes} B in {timeout:.0f}s"
+    if others:
+        info += " other frames " + ",".join(f"0x{c:02x}" for c in others)
+    if text:
+        info += f" console {bytes(text).decode('ascii', 'replace')!r}"
+    return None, info
 
 
 def build_image() -> None:
@@ -176,9 +198,9 @@ def bulk_op(ser: serial.Serial, op_payload: bytes, timeout: float = 3.0):
     ser.reset_input_buffer()
     ser.write(build_frame(USB_BULK, op_payload))
     ser.flush()
-    frame = read_frame(ser, {USB_BULK_ACK}, timeout)
+    frame, info = read_frame(ser, {USB_BULK_ACK}, timeout)
     if frame is None:
-        raise TimeoutError("no ack from ESP")
+        raise TimeoutError(f"no ack from ESP ({info})")
     _, payload = frame
     if len(payload) < 2 or payload[0] != ACK_ID_BULK:
         raise ValueError(f"unexpected ack payload {payload.hex()}")
@@ -188,7 +210,7 @@ def bulk_op(ser: serial.Serial, op_payload: bytes, timeout: float = 3.0):
 
 
 def bulk_op_retry(ser: serial.Serial, op_payload: bytes, timeout: float, label: str,
-                  attempts: int = 5) -> tuple[int, int]:
+                  attempts: int = ATTEMPTS) -> tuple[int, int]:
     """`bulk_op` with retries on transport hiccups (a lost/garbled ack).
 
     Retrying is safe: the ESP and WIO both de-duplicate by sequence number,
@@ -210,11 +232,51 @@ def bulk_op_retry(ser: serial.Serial, op_payload: bytes, timeout: float, label: 
     raise TimeoutError(f"{label}: gave up after {attempts} tries ({last})") from last
 
 
+def send_end(ser: serial.Serial, attempts: int = ATTEMPTS) -> None:
+    """Finalize the transfer (OP_END), robust to both a dropped ESP ack and a
+    WIO-side link timeout. Returns on success; raises on a definitive failure.
+
+    The end step erases/CRC-checks flash and the WIO reboots, so its ack can
+    be lost more easily than a data ack - hence the extra WIO-timeout retry on
+    top of the transport retry. The ESP keeps the transfer open on a WIO
+    timeout, so re-sending OP_END is safe.
+    """
+    for attempt in range(1, attempts + 1):
+        last = attempt >= attempts
+        try:
+            status, _ = bulk_op(ser, bytes([OP_END]), timeout=8.0)
+        except (TimeoutError, ValueError) as e:
+            if last:
+                raise TimeoutError(f"end: no ESP reply after {attempts} tries ({e})") from e
+            print(f"\n  end: {e}; retry {attempt}/{attempts - 1}", flush=True)
+            ser.reset_input_buffer()
+            time.sleep(0.2 * attempt)
+            continue
+        if status == ACK_OK:
+            return
+        # 0x11 = WIO link timeout: the FW_END round-trip did not complete;
+        # the ESP kept the transfer open, so retrying is safe.
+        if status == 0x11 and not last:
+            print(f"\n  end: {status_str(status)}; retry {attempt}/{attempts - 1}", flush=True)
+            time.sleep(0.3)
+            continue
+        # 0x12 = ESP has no active transfer. On a retry this means a previous
+        # OP_END already finalized it (its ack was lost) - the swap is
+        # committed, so treat as success. On the first try it is a real error
+        # (state vanished without finishing).
+        if status == 0x12 and attempt > 1:
+            print("\n  end: ESP reports the transfer already finalized "
+                  "(swap committed); treating as success")
+            return
+        raise RuntimeError(f"end/verify failed: status {status_str(status)}")
+    raise TimeoutError(f"end: WIO never confirmed after {attempts} tries")
+
+
 def ping(ser: serial.Serial) -> bool:
     ser.reset_input_buffer()
     ser.write(build_frame(USB_PING, b""))
     ser.flush()
-    frame = read_frame(ser, {RESP_ACK}, 2.0)
+    frame, _ = read_frame(ser, {RESP_ACK}, 2.0)
     return frame is not None and frame[1][:1] == bytes([USB_PING])
 
 
@@ -291,10 +353,8 @@ def main() -> int:
             print(f"\r  {sent}/{total} bytes ({pct}%)", end="", flush=True)
         print()
 
-        status, _ = bulk_op_retry(ser, bytes([OP_END]), timeout=8.0, label="end/verify")
-        if status != ACK_OK:
-            sys.exit(f"end/verify failed: status {status_str(status)}")
-    except TimeoutError as e:
+        send_end(ser)
+    except (TimeoutError, RuntimeError) as e:
         # Best-effort abort so the WIO/ESP do not sit waiting for the rest.
         try:
             bulk_op(ser, bytes([OP_ABORT]), timeout=1.0)
