@@ -8,21 +8,20 @@ proto/src/link.rs, module `usb`). This tool streams a raw application image
 link into the WIO's DFU partition; on a verified CRC the WIO reboots and the
 swap bootloader installs it.
 
-Build the image first:
-
-    cd wio && cargo objcopy --release -- -O binary wio-e5-gps.bin
-
-Then (the image path and ESP port are both auto-detected):
+Everything is automatic - it builds the image (cargo objcopy in ../wio),
+auto-detects the ESP port and uploads:
 
     pixi run fw-upload
 
-or point it elsewhere with --file / --port.
+Use --no-build to upload the existing image as-is, or --file / --port to
+point elsewhere (an explicit --file is never rebuilt).
 
 The ESP console shares this port, so its text is interleaved with the reply
 frames; the frame parser here resyncs past it by sync byte and CRC.
 """
 
 import argparse
+import subprocess
 import sys
 import time
 import zlib
@@ -132,6 +131,19 @@ def read_frame(ser: serial.Serial, wanted: set, timeout: float):
     return None
 
 
+def build_image() -> None:
+    """Build the WIO image with `cargo objcopy` in the wio/ crate."""
+    wio_dir = DEFAULT_IMAGE.parent
+    cmd = ["cargo", "objcopy", "--release", "--", "-O", "binary", DEFAULT_IMAGE.name]
+    print(f"building image: {' '.join(cmd)} (in {wio_dir})")
+    try:
+        subprocess.run(cmd, cwd=wio_dir, check=True)
+    except FileNotFoundError:
+        sys.exit("cargo not found on PATH - build manually or pass --no-build")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"build failed (exit {e.returncode})")
+
+
 def open_port(port: str | None) -> serial.Serial:
     if port is None:
         for p in list_ports.comports():
@@ -174,12 +186,24 @@ def main() -> int:
     ap.add_argument(
         "--file",
         type=Path,
-        default=DEFAULT_IMAGE,
-        help=f"WIO firmware .bin (objcopy output); default {DEFAULT_IMAGE}",
+        default=None,
+        help=f"WIO firmware .bin to send (default: build {DEFAULT_IMAGE})",
+    )
+    ap.add_argument(
+        "--no-build",
+        action="store_true",
+        help="upload the existing default image instead of rebuilding it",
     )
     ap.add_argument("--port", help="serial port (auto-detected if omitted)")
     ap.add_argument("--version", type=int, default=1, help="firmware version stamp (0-65535)")
     args = ap.parse_args()
+
+    # An explicit --file is used as-is; the default image is (re)built first
+    # unless --no-build.
+    if args.file is None:
+        args.file = DEFAULT_IMAGE
+        if not args.no_build:
+            build_image()
 
     if not args.file.is_file():
         sys.exit(

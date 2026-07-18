@@ -1,4 +1,6 @@
 [toolchain]
 channel    = "nightly"
-components = ["rust-src"]
+# llvm-tools provides llvm-objcopy for `cargo objcopy` (raw firmware image
+# for the UART/BLE update path and tools/fw-upload).
+components = ["rust-src", "llvm-tools"]
 targets    = ["thumbv7em-none-eabi"]

@@ -127,7 +127,9 @@ readable in any spreadsheet. The card is optional and hot-pluggable.
 
 ## WIO firmware update
 
-Build the raw image (objcopy of the ELF):
+The update paths take a raw image (objcopy of the ELF). The ESP-USB
+uploader below builds it for you; to build it by hand (e.g. for the BLE
+path):
 
 ```sh
 cd wio && cargo objcopy --release -- -O binary wio-e5-gps.bin
@@ -145,10 +147,11 @@ kind 2 with size/crc32/version, `OP_DATA` chunks up to 192 bytes,
 **Over the ESP USB:** the same bulk protocol is exposed on the USB
 Serial/JTAG port (framed with the link framing, `link::usb` commands), so a
 computer can flash the WIO through the ESP with no BLE. A host uploader
-lives in `tools/`:
+lives in `tools/`. It builds the image, auto-detects the ESP port and
+uploads, so no arguments are needed:
 
 ```sh
-cd tools && pixi run fw-upload --file ../wio/wio-e5-gps.bin
+cd tools && pixi run fw-upload      # --no-build to skip the rebuild
 ```
 
 The ESP console shares the USB port; the uploader's frame parser resyncs
