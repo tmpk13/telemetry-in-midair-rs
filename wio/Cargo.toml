@@ -27,6 +27,9 @@ embedded-nano-mesh = "2.1.11"
 # embedded-nano-mesh 2.1.x bounds its IO on embedded-io 0.6; do not bump.
 embedded-io = "0.6"
 nb = "1"
+# SPSC ring buffer: the USART2 (ESP link) RX interrupt fills it, the main
+# loop drains it. Same version RTIC already pulls in.
+heapless = "0.8"
 # FAT filesystem so the SD card logs are readable on a phone/computer.
 # Only the BlockDevice trait side is used (the SPI driver is in-repo),
 # so the embedded-hal 1.0 mismatch with stm32wlxx-hal does not matter.

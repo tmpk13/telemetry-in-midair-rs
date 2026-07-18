@@ -536,6 +536,7 @@ dependencies = [
  "embedded-nano-mesh",
  "embedded-sdmmc",
  "gps-proto",
+ "heapless",
  "midair-proto",
  "nb 1.1.0",
  "panic-halt",

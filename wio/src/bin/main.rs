@@ -36,7 +36,7 @@ mod app {
         subghz::SubGhz,
     };
     use wio_e5_gps::cfgxfer::{CfgEvent, CfgTransfer};
-    use wio_e5_gps::esplink::EspLink;
+    use wio_e5_gps::esplink::{self, EspLink, RxProducer, RxQueue};
     use wio_e5_gps::fwupdate::{FwEvent, FwUpdate};
     use wio_e5_gps::gps::Gps;
     use wio_e5_gps::leds::Leds;
@@ -69,9 +69,11 @@ mod app {
         cfgxfer: CfgTransfer,
         cfg: RadioConfig,
         cfg_loaded: bool,
+        /// Producer half of the ESP-link RX ring buffer (USART2 ISR side).
+        esp_rx_prod: RxProducer,
     }
 
-    #[init]
+    #[init(local = [esp_rx_q: RxQueue = RxQueue::new()])]
     fn init(mut cx: init::Context) -> (Shared, Local) {
         let channels = rtt_init! {
             up: {
@@ -142,11 +144,14 @@ mod app {
         radio.print_diagnostics();
         watchdog::feed(&iwdg);
 
+        // ESP-link RX ring buffer: the USART2 ISR fills it, the loop drains.
+        let (esp_rx_prod, esp_rx_cons) = cx.local.esp_rx_q.split();
+
         // GPS on USART1, ESP link on USART2, activity LEDs.
         let (gps, esp, leds) = cortex_m::interrupt::free(|cs| {
             (
                 Gps::new(dp.USART1, gpiob.b6, gpiob.b7, gpiob.b10, &mut rcc, cs),
-                EspLink::new(dp.USART2, gpioa.a2, gpioa.a3, &mut rcc, cs),
+                EspLink::new(dp.USART2, gpioa.a2, gpioa.a3, &mut rcc, cs, esp_rx_cons),
                 Leds::new(gpioa.a9, gpioa.a10, cs),
             )
         });
@@ -172,8 +177,17 @@ mod app {
                 cfgxfer: CfgTransfer::new(),
                 cfg,
                 cfg_loaded,
+                esp_rx_prod,
             },
         )
+    }
+
+    /// USART2 (ESP link) RX interrupt: empty the hardware FIFO into the ring
+    /// buffer so no byte is lost while the priority-1 run task is busy. Higher
+    /// priority than run so it preempts the loop's GPS/SD/delay work.
+    #[task(binds = USART2, priority = 2, local = [esp_rx_prod])]
+    fn esp_rx(cx: esp_rx::Context) {
+        esplink::drain_rx_isr(cx.local.esp_rx_prod);
     }
 
     #[task(local = [io, mesh, gps, sdlog, esp, leds, flash, iwdg, fw, cfgxfer, cfg, cfg_loaded], priority = 1)]
