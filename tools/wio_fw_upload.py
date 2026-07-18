@@ -57,6 +57,20 @@ KIND_FIRMWARE = 2
 ACK_ID_BULK = 0x20
 ACK_OK = 0
 
+# Bulk ack status codes (gps-proto packet ACK_* + midair-proto ble ACK_*).
+STATUS_NAMES = {
+    0x00: "OK",
+    0x01: "unknown id",
+    0x02: "bad value",
+    0x10: "WIO error (NAK from the WIO)",
+    0x11: "WIO link timeout (ESP got no ack from the WIO)",
+    0x12: "bad state (a transfer is already active?)",
+}
+
+
+def status_str(status: int) -> str:
+    return f"{status} ({STATUS_NAMES.get(status, 'unknown')})"
+
 # Data bytes per OP_DATA (link::DATA_CHUNK) and the WIO ACTIVE partition size.
 DATA_CHUNK = 192
 MAX_FW_SIZE = 56 * 2048
@@ -229,7 +243,14 @@ def main() -> int:
         + crc.to_bytes(4, "little") + args.version.to_bytes(2, "little")
     status, _ = bulk_op(ser, begin, timeout=3.0)
     if status != ACK_OK:
-        sys.exit(f"begin rejected (status {status})")
+        msg = f"begin rejected: status {status_str(status)}"
+        if status in (0x10, 0x11):
+            msg += (
+                "\nthe ESP could not get an ack from the WIO. Is the WIO running "
+                "working firmware, powered (ESP GPIO2 rail on) and not held in reset?"
+                "\nfor the first/recovery flash use SWD: cd wio && cargo run --release"
+            )
+        sys.exit(msg)
     print("transfer started")
 
     seq = 0
@@ -240,7 +261,7 @@ def main() -> int:
         status, next_seq = bulk_op(ser, op, timeout=3.0)
         if status != ACK_OK:
             bulk_op(ser, bytes([OP_ABORT]))
-            sys.exit(f"\nchunk seq {seq} rejected (status {status})")
+            sys.exit(f"\nchunk seq {seq} rejected: status {status_str(status)}")
         seq = next_seq & 0xFFFF
         sent += len(chunk)
         pct = 100 * sent // total
@@ -249,7 +270,7 @@ def main() -> int:
 
     status, _ = bulk_op(ser, bytes([OP_END]), timeout=8.0)
     if status != ACK_OK:
-        sys.exit(f"end/verify failed (status {status})")
+        sys.exit(f"end/verify failed: status {status_str(status)}")
     print("image verified; WIO rebooting into swap bootloader")
     return 0
 
