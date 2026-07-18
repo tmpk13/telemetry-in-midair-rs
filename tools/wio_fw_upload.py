@@ -187,6 +187,29 @@ def bulk_op(ser: serial.Serial, op_payload: bytes, timeout: float = 3.0):
     return status, next_seq
 
 
+def bulk_op_retry(ser: serial.Serial, op_payload: bytes, timeout: float, label: str,
+                  attempts: int = 5) -> tuple[int, int]:
+    """`bulk_op` with retries on transport hiccups (a lost/garbled ack).
+
+    Retrying is safe: the ESP and WIO both de-duplicate by sequence number,
+    so re-sending the same frame either re-acks (already applied) or applies
+    it now. A returned protocol status (incl. a NAK) is passed straight back
+    to the caller; only transport failures (timeout / bad ack frame) retry.
+    """
+    last: Exception = TimeoutError(f"{label}: no attempts made")
+    for attempt in range(1, attempts + 1):
+        try:
+            return bulk_op(ser, op_payload, timeout)
+        except (TimeoutError, ValueError) as e:
+            last = e
+            if attempt >= attempts:
+                break
+            print(f"\n  {label}: {e}; retry {attempt}/{attempts - 1}", flush=True)
+            ser.reset_input_buffer()
+            time.sleep(0.1 * attempt)
+    raise TimeoutError(f"{label}: gave up after {attempts} tries ({last})") from last
+
+
 def ping(ser: serial.Serial) -> bool:
     ser.reset_input_buffer()
     ser.write(build_frame(USB_PING, b""))
@@ -241,36 +264,44 @@ def main() -> int:
 
     begin = bytes([OP_BEGIN, KIND_FIRMWARE]) + total.to_bytes(4, "little") \
         + crc.to_bytes(4, "little") + args.version.to_bytes(2, "little")
-    status, _ = bulk_op(ser, begin, timeout=3.0)
-    if status != ACK_OK:
-        msg = f"begin rejected: status {status_str(status)}"
-        if status in (0x10, 0x11):
-            msg += (
-                "\nthe ESP could not get an ack from the WIO. Is the WIO running "
-                "working firmware, powered (ESP GPIO2 rail on) and not held in reset?"
-                "\nfor the first/recovery flash use SWD: cd wio && cargo run --release"
-            )
-        sys.exit(msg)
-    print("transfer started")
-
-    seq = 0
-    sent = 0
-    for off in range(0, total, DATA_CHUNK):
-        chunk = image[off:off + DATA_CHUNK]
-        op = bytes([OP_DATA]) + seq.to_bytes(2, "little") + chunk
-        status, next_seq = bulk_op(ser, op, timeout=3.0)
+    try:
+        status, _ = bulk_op_retry(ser, begin, timeout=3.0, label="begin")
         if status != ACK_OK:
-            bulk_op(ser, bytes([OP_ABORT]))
-            sys.exit(f"\nchunk seq {seq} rejected: status {status_str(status)}")
-        seq = next_seq & 0xFFFF
-        sent += len(chunk)
-        pct = 100 * sent // total
-        print(f"\r  {sent}/{total} bytes ({pct}%)", end="", flush=True)
-    print()
+            msg = f"begin rejected: status {status_str(status)}"
+            if status in (0x10, 0x11):
+                msg += (
+                    "\nthe ESP could not get an ack from the WIO. Is the WIO running "
+                    "working firmware, powered (ESP GPIO2 rail on) and not held in reset?"
+                    "\nfor the first/recovery flash use SWD: cd wio && cargo run --release"
+                )
+            sys.exit(msg)
+        print("transfer started")
 
-    status, _ = bulk_op(ser, bytes([OP_END]), timeout=8.0)
-    if status != ACK_OK:
-        sys.exit(f"end/verify failed: status {status_str(status)}")
+        seq = 0
+        sent = 0
+        for off in range(0, total, DATA_CHUNK):
+            chunk = image[off:off + DATA_CHUNK]
+            op = bytes([OP_DATA]) + seq.to_bytes(2, "little") + chunk
+            status, next_seq = bulk_op_retry(ser, op, timeout=3.0, label=f"chunk seq {seq}")
+            if status != ACK_OK:
+                sys.exit(f"\nchunk seq {seq} rejected: status {status_str(status)}")
+            seq = next_seq & 0xFFFF
+            sent += len(chunk)
+            pct = 100 * sent // total
+            print(f"\r  {sent}/{total} bytes ({pct}%)", end="", flush=True)
+        print()
+
+        status, _ = bulk_op_retry(ser, bytes([OP_END]), timeout=8.0, label="end/verify")
+        if status != ACK_OK:
+            sys.exit(f"end/verify failed: status {status_str(status)}")
+    except TimeoutError as e:
+        # Best-effort abort so the WIO/ESP do not sit waiting for the rest.
+        try:
+            bulk_op(ser, bytes([OP_ABORT]), timeout=1.0)
+        except (TimeoutError, ValueError):
+            pass
+        sys.exit(f"\nupload failed: {e}")
+
     print("image verified; WIO rebooting into swap bootloader")
     return 0
 
