@@ -90,6 +90,9 @@ const WAKE_ADV_WINDOW_S: u64 = 15;
 /// Linger after a disconnect (sleep mode active) so the phone can come
 /// straight back before the C6 vanishes.
 const SLEEP_LINGER_S: u64 = 5;
+/// Grace period between acking a stow request and dropping the link, so
+/// the app sees its ack rather than a bare disconnect.
+const STOW_ACK_GRACE_MS: u64 = 500;
 
 // ---------------------------------------------------------------------------
 // Cached state (UART link task writes, BLE session samples)
@@ -147,6 +150,9 @@ const PFLAG_GPS_SLEEP: u32 = 1 << 2;
 #[derive(Clone, Copy)]
 struct Persist {
     sleep_interval_s: u32,
+    /// Extended low-power sleep, armed by `CFG_ESP_STOW_S`. Non-zero
+    /// overrides `sleep_interval_s` until a central connects.
+    stow_interval_s: u32,
     flags: u32,
 }
 
@@ -159,17 +165,21 @@ static PERSIST_MAGIC_WORD: PersistU32 = PersistU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static PERSIST_INTERVAL: PersistU32 = PersistU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
+static PERSIST_STOW: PersistU32 = PersistU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
 static PERSIST_FLAGS: PersistU32 = PersistU32::new(0);
 
 fn persist_get() -> Persist {
     if PERSIST_MAGIC_WORD.load(PersistOrdering::Relaxed) == PERSIST_MAGIC {
         Persist {
             sleep_interval_s: PERSIST_INTERVAL.load(PersistOrdering::Relaxed),
+            stow_interval_s: PERSIST_STOW.load(PersistOrdering::Relaxed),
             flags: PERSIST_FLAGS.load(PersistOrdering::Relaxed),
         }
     } else {
         Persist {
             sleep_interval_s: 0,
+            stow_interval_s: 0,
             flags: 0,
         }
     }
@@ -179,8 +189,21 @@ fn persist_update(f: impl FnOnce(&mut Persist)) {
     let mut p = persist_get();
     f(&mut p);
     PERSIST_INTERVAL.store(p.sleep_interval_s, PersistOrdering::Relaxed);
+    PERSIST_STOW.store(p.stow_interval_s, PersistOrdering::Relaxed);
     PERSIST_FLAGS.store(p.flags, PersistOrdering::Relaxed);
     PERSIST_MAGIC_WORD.store(PERSIST_MAGIC, PersistOrdering::Relaxed);
+}
+
+/// Interval for the next deep sleep, 0 = stay awake and keep advertising.
+/// Stow wins while armed so a stowed board keeps its long interval even
+/// though the routine wake-check setting is still stored underneath it.
+fn next_sleep_interval_s() -> u32 {
+    let p = persist_get();
+    if p.stow_interval_s > 0 {
+        p.stow_interval_s
+    } else {
+        p.sleep_interval_s
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +215,15 @@ static PWR_PIN: Mutex<CriticalSectionRawMutex, RefCell<Option<Output<'static>>>>
 static RST_PIN: Mutex<CriticalSectionRawMutex, RefCell<Option<Output<'static>>>> =
     Mutex::new(RefCell::new(None));
 
-fn set_pwr_en(on: bool) {
+/// Current level of the GPS/LoRa rail, so tasks that need the WIO alive
+/// (the heartbeat) can stay quiet while it is unpowered.
+static RAIL_ON: AtomicBool = AtomicBool::new(false);
+
+/// Drive the rail without touching the persisted setting. Used for the
+/// states the firmware picks on its own - dark through deep sleep and
+/// through a wake-check window - which must not overwrite what the app
+/// last asked for.
+fn drive_pwr(on: bool) {
     PWR_PIN.lock(|p| {
         if let Some(pin) = p.borrow_mut().as_mut() {
             if on {
@@ -202,6 +233,16 @@ fn set_pwr_en(on: bool) {
             }
         }
     });
+    RAIL_ON.store(on, PersistOrdering::Relaxed);
+}
+
+/// Rail state the app asked for, i.e. what to restore on a connect.
+fn pwr_configured_on() -> bool {
+    persist_get().flags & PFLAG_PWR_OFF == 0
+}
+
+fn set_pwr_en(on: bool) {
+    drive_pwr(on);
     persist_update(|p| {
         if on {
             p.flags &= !PFLAG_PWR_OFF;
@@ -289,6 +330,11 @@ static OUT_CHANNEL: Channel<CriticalSectionRawMutex, OutFrame, 8> = Channel::new
 /// (is_ack, acked cmd, value-or-err) from the last ACK/NAK frame.
 static ACK_SIGNAL: Signal<CriticalSectionRawMutex, (bool, u8, u16)> = Signal::new();
 
+/// Raised by a `CFG_ESP_STOW_S` write carrying the stow interval. Ends the
+/// session so the board goes down without waiting for the central to
+/// disconnect - the app arms stow and walks away.
+static STOW_ARMED: Signal<CriticalSectionRawMutex, u32> = Signal::new();
+
 /// Serializes [`wio_request`] so a firmware transfer over USB and a config
 /// write over BLE cannot race for the single [`ACK_SIGNAL`].
 static LINK_LOCK: AsyncMutex<CriticalSectionRawMutex, ()> = AsyncMutex::new(());
@@ -367,6 +413,11 @@ async fn heartbeat_task() {
     loop {
         Timer::after(Duration::from_secs(HEARTBEAT_INTERVAL_S)).await;
         if FW_XFER_ACTIVE.load(PersistOrdering::Acquire) {
+            continue;
+        }
+        if !RAIL_ON.load(PersistOrdering::Relaxed) {
+            // The WIO has no power - a ping could only ever time out, and
+            // reporting that as a dead link would be misleading.
             continue;
         }
         let up = match wio_request(cmd::PING, &[], HEARTBEAT_TIMEOUT_MS).await {
@@ -659,13 +710,15 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::system::SleepSource::Timer
     );
 
-    // Power rail first so the WIO/GPS state matches what was configured
-    // before the deep sleep; then release the deep-sleep pad holds.
-    let pwr_level = if persist.flags & PFLAG_PWR_OFF != 0 {
-        Level::Low
-    } else {
-        Level::High
-    };
+    // Power rail first, then release the deep-sleep pad holds.
+    //
+    // A wake check comes up dark: the point of the interval is to ask
+    // whether the app wants us back, which needs BLE only. The rail is
+    // raised in `serve_task` if a central actually connects, so a wake
+    // that nobody answers never pays for the WIO/GPS at all. A cold boot
+    // follows whatever the app last configured.
+    let rail_on = !woke_from_sleep && persist.flags & PFLAG_PWR_OFF == 0;
+    let pwr_level = if rail_on { Level::High } else { Level::Low };
     let pwr = Output::new(peripherals.GPIO2, pwr_level, OutputConfig::default());
     let rst = Output::new(
         peripherals.GPIO6,
@@ -680,6 +733,7 @@ async fn main(spawner: Spawner) -> ! {
     }
     PWR_PIN.lock(|p| p.borrow_mut().replace(pwr));
     RST_PIN.lock(|p| p.borrow_mut().replace(rst));
+    RAIL_ON.store(rail_on, PersistOrdering::Relaxed);
 
     let led = Output::new(peripherals.GPIO3, Level::Low, OutputConfig::default());
     spawner.spawn(led_task(led)).expect("spawn led task");
@@ -753,11 +807,19 @@ async fn ble_host_task<C: Controller, P: PacketPool>(runner: &mut Runner<'_, C, 
     }
 }
 
-/// Put the board to deep sleep for the configured interval. GPIO2 (power
-/// rail) and GPIO6 (WIO reset) are pad-held so the WIO keeps running and
-/// logging while the C6 sleeps.
+/// Put the board to deep sleep for the configured interval. The GPS/LoRa
+/// rail goes dark first: the WIO-E5 and MAX-M10 together draw on the order
+/// of 30 mA, roughly a thousand times the sleeping C6, so leaving them up
+/// would make the sleep interval pointless. GPIO2 (rail enable, now low)
+/// and GPIO6 (WIO reset) are pad-held so the levels survive the sleep.
+///
+/// GPIO6 is held released rather than asserted: it is open-drain, and with
+/// the rail dead the WIO is already held in reset by its own power-on
+/// reset, so pulling the line down would only risk sinking through an
+/// always-on pull-up.
 fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
-    println!("deep sleep for {} s", interval_s);
+    println!("deep sleep for {} s (gps/lora rail off)", interval_s);
+    drive_pwr(false);
     unsafe {
         esp_hal::peripherals::GPIO2::steal().rtcio_pad_hold(true);
         esp_hal::peripherals::GPIO6::steal().rtcio_pad_hold(true);
@@ -793,7 +855,7 @@ async fn serve_task<C: Controller>(
     // First window after boot: with sleep mode on, stay reachable for the
     // advertising window and then sleep.
     loop {
-        let sleep_interval = persist_get().sleep_interval_s;
+        let sleep_interval = next_sleep_interval_s();
         qprintln!("advertising as {}", ble::DEVICE_NAME);
         let advertiser = match peripheral
             .advertise(
@@ -834,11 +896,33 @@ async fn serve_task<C: Controller>(
             Err(_) => continue,
         };
         qprintln!("central connected");
+
+        // Somebody answered, so stow mode has done its job - disarm it or
+        // the board would drop back into a multi-hour sleep the moment
+        // this session ends.
+        if persist_get().stow_interval_s > 0 {
+            persist_update(|p| p.stow_interval_s = 0);
+            qprintln!("stow disarmed by connect");
+        }
+        // The rail is dark on every wake check; raise it now if that is
+        // what the app configured. The WIO needs its boot time and the GPS
+        // a cold TTFF from here, since both just came up from no power.
+        if !RAIL_ON.load(PersistOrdering::Relaxed) && pwr_configured_on() {
+            qprintln!("powering gps/lora rail for session");
+            drive_pwr(true);
+        }
+
         gatt_session(&conn, server).await;
         qprintln!("central disconnected");
 
+        let sleep_interval = next_sleep_interval_s();
+        if STOW_ARMED.signaled() {
+            // Deliberate stow: go down now. Lingering would only keep the
+            // radio up for a central that just asked us to disappear.
+            STOW_ARMED.reset();
+            enter_deep_sleep(rtc, sleep_interval);
+        }
         // Sleep mode: give the central a moment to reconnect, then sleep.
-        let sleep_interval = persist_get().sleep_interval_s;
         if sleep_interval > 0 {
             Timer::after(Duration::from_secs(SLEEP_LINGER_S)).await;
             enter_deep_sleep(rtc, sleep_interval);
@@ -943,8 +1027,16 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
         }
     };
 
-    // Any arm ending (disconnect / position-notify failure) ends the session.
-    select3(events, notifier, logger).await;
+    // A stow write acks from inside `events`, so give that ack a moment on
+    // the air before this arm tears the connection down.
+    let stow = async {
+        STOW_ARMED.wait().await;
+        Timer::after(Duration::from_millis(STOW_ACK_GRACE_MS)).await;
+    };
+
+    // Any arm ending (disconnect / position-notify failure / stow) ends the
+    // session.
+    select(select3(events, notifier, logger), stow).await;
 }
 
 /// Apply a config write and build the ack to send back.
@@ -1004,6 +1096,25 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                     }
                     persist_update(|p| p.sleep_interval_s = secs);
                     qprintln!("config: esp sleep interval {} s", secs);
+                    return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
+                }
+                return packet::encode_ack(id, packet::ACK_BAD_VALUE, &[]);
+            }
+            ble::CFG_ESP_STOW_S => {
+                if let Ok(bytes) = <[u8; 4]>::try_from(value) {
+                    let mut secs = u32::from_le_bytes(bytes);
+                    if secs > 0 {
+                        secs = secs.clamp(ble::ESP_STOW_MIN_S, ble::ESP_STOW_MAX_S);
+                    }
+                    persist_update(|p| p.stow_interval_s = secs);
+                    if secs > 0 {
+                        // Ack first: arming ends this session, so the write
+                        // would otherwise go unanswered.
+                        qprintln!("config: stow for {} s, sleeping after ack", secs);
+                        STOW_ARMED.signal(secs);
+                    } else {
+                        qprintln!("config: stow disarmed");
+                    }
                     return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
                 }
                 return packet::encode_ack(id, packet::ACK_BAD_VALUE, &[]);

@@ -45,11 +45,34 @@ pub const CFG_GPS_SLEEP: u8 = 0x12;
 /// `u32` seconds: ESP deep-sleep wake-check interval. While set (non-zero)
 /// the ESP deep-sleeps whenever no central is connected, waking every
 /// interval to advertise for a short window. 0 disables sleep mode.
+///
+/// This is the responsive cadence - seconds to minutes - so the app can
+/// get the board back without a long wait. For storage or transport use
+/// [`CFG_ESP_STOW_S`] instead.
 pub const CFG_ESP_SLEEP_S: u8 = 0x13;
 
 /// Clamp range for [`CFG_ESP_SLEEP_S`].
 pub const ESP_SLEEP_MIN_S: u32 = 5;
-pub const ESP_SLEEP_MAX_S: u32 = 24 * 3600;
+pub const ESP_SLEEP_MAX_S: u32 = 15 * 60;
+
+/// `u32` seconds: arm the extended low-power ("stow") sleep and enter it
+/// immediately. Takes precedence over [`CFG_ESP_SLEEP_S`] until a central
+/// connects, which disarms it and restores the routine interval.
+///
+/// Each stow wake advertises for the same short window; if nobody answers
+/// the board stows again, so an unattended tracker keeps to the long
+/// interval indefinitely. The GPS/LoRa rail stays off throughout.
+///
+/// Note the wake is timed by the C6's uncalibrated RC slow clock, so a
+/// multi-hour interval can drift by tens of minutes. It paces a
+/// wake-check, not a schedule.
+pub const CFG_ESP_STOW_S: u8 = 0x14;
+
+/// Clamp range for [`CFG_ESP_STOW_S`]. The lower bound meets
+/// [`ESP_SLEEP_MAX_S`] so every interval is reachable through one id or
+/// the other.
+pub const ESP_STOW_MIN_S: u32 = 15 * 60;
+pub const ESP_STOW_MAX_S: u32 = 24 * 3600;
 
 // -- Bulk transfer protocol (writes on [`BULK_UUID`]) -------------------------
 //

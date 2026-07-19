@@ -126,12 +126,34 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x10` | u8 0/1 | GPS + LoRa power rail (LDO) off/on |
 | `0x11` | u8 0/1 | WIO soft sleep (reset-pulse fallback on wake) |
 | `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / EXTINT wake) |
-| `0x13` | u32 s | ESP deep-sleep wake-check interval, 0 = off |
+| `0x13` | u32 s | ESP deep-sleep wake-check interval, 5 s..15 min, 0 = off |
+| `0x14` | u32 s | extended "stow" sleep, 15 min..24 h, 0 = disarm |
 
-With a sleep interval set, the C6 deep-sleeps whenever no central is
-connected and wakes every interval to advertise for 15 s (double D2
-blink). The power rail and WIO reset pins are pad-held through sleep, so
-the WIO keeps logging.
+### Low power
+
+Both sleep ids drive the same deep sleep and differ only in cadence and
+in how they are armed:
+
+- **`0x13` wake-check** - the responsive cadence, seconds to minutes.
+  While set, the C6 deep-sleeps whenever no central is connected and
+  wakes every interval to advertise for 15 s (double D2 blink). Persists
+  until changed.
+- **`0x14` stow** - one long interval for storage or transport. Writing
+  it acks, drops the connection and sleeps immediately. Each wake still
+  advertises the same 15 s; if nobody answers, the board stows again, so
+  it keeps the long interval indefinitely. A connect disarms stow and the
+  `0x13` cadence takes over again.
+
+The GPS/LoRa rail is **off** for the whole sleep and stays off through
+the wake-check advertising window - a wake that nobody answers never
+powers the WIO or GPS at all. The rail comes up only when a central
+actually connects (and only if `0x10` has it enabled), so the app should
+expect the WIO's boot time plus a GPS cold TTFF after connecting.
+
+Both intervals live in RTC RAM: they survive deep sleep, not a power
+cycle. The wake is timed by the C6's uncalibrated RC slow clock, so a
+multi-hour stow can drift by tens of minutes - it paces a wake-check,
+not a schedule.
 
 ## SD card
 
