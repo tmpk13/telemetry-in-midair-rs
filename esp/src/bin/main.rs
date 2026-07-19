@@ -60,12 +60,22 @@ use trouble_host::prelude::*;
 
 extern crate alloc;
 
-/// Like [`println!`] but only emits when the `verbose` cargo feature is on.
+/// Like [`println!`] but silent while a bulk transfer owns the USB link
+/// (see [`console_busy`]).
+macro_rules! qprintln {
+    ($($arg:tt)*) => {
+        if !console_busy() {
+            ::esp_println::println!($($arg)*);
+        }
+    };
+}
+
+/// Like [`qprintln!`] but only emits when the `verbose` cargo feature is on.
 /// The arguments are always type-checked; the call is dead-code eliminated
 /// in a non-verbose build.
 macro_rules! vprintln {
     ($($arg:tt)*) => {
-        if cfg!(feature = "verbose") {
+        if cfg!(feature = "verbose") && !console_busy() {
             ::esp_println::println!($($arg)*);
         }
     };
@@ -288,6 +298,17 @@ static LINK_LOCK: AsyncMutex<CriticalSectionRawMutex, ()> = AsyncMutex::new(());
 /// firmware stream.
 static FW_XFER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Whether console output must stay quiet.
+///
+/// esp-println and the USB reply frames share the single 64-byte USB
+/// Serial/JTAG IN FIFO with no arbitration between them, so console text
+/// emitted from another task lands in the middle of a transfer's ack
+/// frames and costs the host a 3 s retry per collision. During a bulk
+/// transfer the frames win and everything discretionary goes silent.
+fn console_busy() -> bool {
+    FW_XFER_ACTIVE.load(PersistOrdering::Acquire)
+}
+
 /// Whether the WIO answered the last heartbeat ping. Cleared on boot and
 /// whenever a ping goes unanswered, so the console reflects the live link
 /// state (see [`heartbeat_task`]).
@@ -437,13 +458,14 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
         }
         msg::LORA_RX => {
             // Non-position mesh traffic: just log it on the console.
-            println!("lora rx from {} ({} bytes)", payload.first().unwrap_or(&0), payload.len().saturating_sub(3));
+            qprintln!("lora rx from {} ({} bytes)", payload.first().unwrap_or(&0), payload.len().saturating_sub(3));
         }
         msg::LOG => {
             // WIO status line: print to the USB console and hand it to the
             // BLE session to notify the connected central.
             let text = core::str::from_utf8(payload).unwrap_or("<non-utf8 status>");
-            println!("wio: {}", text);
+            // Console only; the BLE notify below still goes out mid-transfer.
+            qprintln!("wio: {}", text);
             let mut line = heapless::Vec::new();
             let n = payload.len().min(link::LOG_MAX);
             if line.extend_from_slice(&payload[..n]).is_ok() {
@@ -502,9 +524,25 @@ async fn link_task(mut rx: UartRx<'static, Async>, mut tx: UartTx<'static, Async
 /// each is run through [`handle_bulk`] into the WIO, the ack framed back.
 /// The console (esp-println) shares the port; the host's frame parser
 /// resyncs past that text by sync byte + CRC.
+/// Write one reply frame to the USB host.
+///
+/// The leading flush is what keeps the frame intact. esp-hal's async writer
+/// stages bytes into the USB Serial/JTAG IN FIFO without checking that the
+/// FIFO has room, so with a console packet still draining the hardware
+/// silently drops whatever no longer fits - the host then sees a truncated
+/// frame, waits out its timeout and retries the whole chunk. Only `flush`
+/// tests `serial_in_ep_data_free`, so flushing first is how this waits for
+/// the FIFO to actually be free.
+async fn send_usb_frame(tx: &mut UsbSerialJtagTx<'static, Async>, bytes: &[u8]) {
+    use embedded_io_async::Write as _;
+    let _ = tx.flush().await;
+    let _ = tx.write_all(bytes).await;
+    let _ = tx.flush().await;
+}
+
 #[embassy_executor::task]
 async fn usb_task(mut rx: UsbSerialJtagRx<'static, Async>, mut tx: UsbSerialJtagTx<'static, Async>) {
-    use embedded_io_async::{Read as _, Write as _};
+    use embedded_io_async::Read as _;
     let mut parser = FrameParser::new();
     let mut out = FrameBuf::new();
     let mut bulk: Option<BulkState> = None;
@@ -550,14 +588,12 @@ async fn usb_task(mut rx: UsbSerialJtagRx<'static, Async>, mut tx: UsbSerialJtag
             match cmd_id {
                 link::usb::PING => {
                     out.build(link::resp::ACK, &[link::usb::PING, 1, 0]);
-                    let _ = tx.write_all(out.as_bytes()).await;
-                    let _ = tx.flush().await;
+                    send_usb_frame(&mut tx, out.as_bytes()).await;
                 }
                 link::usb::BULK => {
                     let (ack, alen) = handle_bulk(&p[..len], &mut bulk).await;
                     out.build(link::usb::BULK_ACK, &ack[..alen]);
-                    let _ = tx.write_all(out.as_bytes()).await;
-                    let _ = tx.flush().await;
+                    send_usb_frame(&mut tx, out.as_bytes()).await;
                 }
                 _ => {}
             }
@@ -711,7 +747,7 @@ async fn main(spawner: Spawner) -> ! {
 async fn ble_host_task<C: Controller, P: PacketPool>(runner: &mut Runner<'_, C, P>) {
     loop {
         if runner.run().await.is_err() {
-            println!("ble host error, restarting");
+            qprintln!("ble host error, restarting");
             Timer::after(Duration::from_millis(100)).await;
         }
     }
@@ -758,7 +794,7 @@ async fn serve_task<C: Controller>(
     // advertising window and then sleep.
     loop {
         let sleep_interval = persist_get().sleep_interval_s;
-        println!("advertising as {}", ble::DEVICE_NAME);
+        qprintln!("advertising as {}", ble::DEVICE_NAME);
         let advertiser = match peripheral
             .advertise(
                 &AdvertisementParameters::default(),
@@ -797,9 +833,9 @@ async fn serve_task<C: Controller>(
             Ok(c) => c,
             Err(_) => continue,
         };
-        println!("central connected");
+        qprintln!("central connected");
         gatt_session(&conn, server).await;
-        println!("central disconnected");
+        qprintln!("central disconnected");
 
         // Sleep mode: give the central a moment to reconnect, then sleep.
         let sleep_interval = persist_get().sleep_interval_s;
@@ -922,7 +958,7 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
             ble::CFG_PWR_EN => {
                 let on = value.first().copied().unwrap_or(1) != 0;
                 set_pwr_en(on);
-                println!("config: power rail {}", if on { "on" } else { "off" });
+                qprintln!("config: power rail {}", if on { "on" } else { "off" });
                 return packet::encode_ack(id, packet::ACK_OK, &[on as u8]);
             }
             ble::CFG_WIO_SLEEP => {
@@ -937,7 +973,7 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                 let result = wio_request(cmd::WIO_SLEEP, &[sleep as u8], 500).await;
                 if result.is_err() && !sleep {
                     // Wake fallback: hard reset brings it back awake.
-                    println!("config: wio wake timed out, pulsing reset");
+                    qprintln!("config: wio wake timed out, pulsing reset");
                     pulse_wio_reset().await;
                     return packet::encode_ack(id, packet::ACK_OK, &[0]);
                 }
@@ -967,7 +1003,7 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                         secs = secs.clamp(ble::ESP_SLEEP_MIN_S, ble::ESP_SLEEP_MAX_S);
                     }
                     persist_update(|p| p.sleep_interval_s = secs);
-                    println!("config: esp sleep interval {} s", secs);
+                    qprintln!("config: esp sleep interval {} s", secs);
                     return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
                 }
                 return packet::encode_ack(id, packet::ACK_BAD_VALUE, &[]);
@@ -980,7 +1016,7 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         Ok(packet::ConfigCommand::UpdateIntervalMs(ms)) => {
             let applied = packet::clamp_interval(ms);
             NOTIFY_INTERVAL_MS.lock(|c| c.set(applied));
-            println!("config: notify interval set to {} ms", applied);
+            qprintln!("config: notify interval set to {} ms", applied);
             packet::encode_ack(
                 packet::CFG_UPDATE_INTERVAL_MS,
                 packet::ACK_OK,
@@ -989,7 +1025,7 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         }
         Err(status) => {
             let id = data.first().copied().unwrap_or(0);
-            println!("config: rejected write (status {})", status);
+            qprintln!("config: rejected write (status {})", status);
             packet::encode_ack(id, status, &[])
         }
     }
