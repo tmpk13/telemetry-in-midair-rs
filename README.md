@@ -236,12 +236,3 @@ past the console text. Only one transfer (BLE or USB) runs at a time.
 
 Inital WIO wipe:
 `openocd -f interface/cmsis-dap.cfg -f target/stm32wlx.cfg -c "init; reset halt; stm32l4x unlock 0; reset halt; exit"`
-
-
-
-# Known Issues
-
-Pin 28 on WIO should be NC
-SMA footprint
-
-Maybe need a larger capacitor on WIO-E5 input? Check this.
