@@ -33,11 +33,8 @@ cd wio && cargo run --release                 # app, RTT console
 cd esp && cargo run --release
 # ...with per-frame link + per-heartbeat logging:
 cd esp && cargo run --release --features verbose
-
-# bench tool: check over UART whether the WIO is alive (powers the rail,
-# pulses reset, probes factory AT firmware at 9600 and the link PING at
-# 115200; results on the USB console)
-cd esp && cargo run --release --bin wio-probe
+# same thing from the tools env:
+cd tools && pixi run esp-upload
 ```
 
 Note the WIO only has power while the ESP drives the LDO enable

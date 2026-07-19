@@ -8,12 +8,6 @@ version      = "0.1.0"
 name = "esp32c6-gps"
 path = "./src/bin/main.rs"
 
-# Bench tool: checks over UART whether the WIO-E5 is alive (factory AT
-# firmware at 9600 or wio-e5-gps link PING at 115200).
-[[bin]]
-name = "wio-probe"
-path = "./src/bin/wio_probe.rs"
-
 [features]
 default = []
 # Extra console logging: every WIO link frame, decoded GPS position /

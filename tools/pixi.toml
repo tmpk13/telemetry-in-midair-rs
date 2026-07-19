@@ -15,3 +15,7 @@ pyserial = ">=3.5"
 #   pixi run fw-upload
 # --no-build uploads the existing image; --file / --port override.
 fw-upload = "python wio_fw_upload.py"
+
+# Build and flash the ESP32-C6 over its USB Serial/JTAG port, then stay
+# attached to the console (verbose: per-frame link and heartbeat logs).
+esp-upload = { cmd = "cargo run --release --features verbose", cwd = "../esp" }
