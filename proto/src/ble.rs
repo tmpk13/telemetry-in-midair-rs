@@ -34,6 +34,80 @@ pub const REMOTE_LEN: usize = 1 + 2 + gps_proto::packet::POSITION_PACKET_LEN;
 // Payload format is gps-proto's `[id, len, value]`; acks come back on the
 // ack characteristic with the applied value.
 
+/// Current device settings, readable so an app can populate its controls
+/// on connect instead of assuming defaults, and notified whenever a value
+/// changes (including changes the device makes itself, such as clamping a
+/// requested interval or disarming stow on connect).
+pub const SETTINGS_UUID: &str = "c3a10009-9f6e-4b2c-8f5a-2e32c3b1e5d0";
+pub const SETTINGS_UUID_U128: u128 = 0xc3a10009_9f6e_4b2c_8f5a_2e32c3b1e5d0;
+
+/// Wire length of [`Settings`].
+pub const SETTINGS_LEN: usize = 16;
+/// Layout version in byte 0, so an app meeting a newer firmware can
+/// reject the blob rather than misread it.
+pub const SETTINGS_VERSION: u8 = 1;
+
+pub const SFLAG_PWR_EN: u8 = 1 << 0;
+pub const SFLAG_WIO_SLEEP: u8 = 1 << 1;
+pub const SFLAG_GPS_SLEEP: u8 = 1 << 2;
+
+/// Everything the config characteristic can set, in one readable blob.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// GPS/LoRa rail enabled ([`CFG_PWR_EN`]).
+    pub pwr_en: bool,
+    /// WIO soft sleep ([`CFG_WIO_SLEEP`]).
+    pub wio_sleep: bool,
+    /// GPS backup mode ([`CFG_GPS_SLEEP`]).
+    pub gps_sleep: bool,
+    /// Wake-check interval ([`CFG_ESP_SLEEP_S`]), 0 = sleep disabled.
+    pub sleep_interval_s: u32,
+    /// Extended stow interval ([`CFG_ESP_STOW_S`]), 0 = disarmed.
+    pub stow_interval_s: u32,
+    /// Position notify interval in ms (gps-proto config id 0x01).
+    pub notify_interval_ms: u32,
+}
+
+impl Settings {
+    pub fn encode(&self) -> [u8; SETTINGS_LEN] {
+        let mut b = [0u8; SETTINGS_LEN];
+        b[0] = SETTINGS_VERSION;
+        let mut flags = 0u8;
+        if self.pwr_en {
+            flags |= SFLAG_PWR_EN;
+        }
+        if self.wio_sleep {
+            flags |= SFLAG_WIO_SLEEP;
+        }
+        if self.gps_sleep {
+            flags |= SFLAG_GPS_SLEEP;
+        }
+        b[1] = flags;
+        // b[2..4] reserved, kept zero to word-align the u32s.
+        b[4..8].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
+        b[8..12].copy_from_slice(&self.stow_interval_s.to_le_bytes());
+        b[12..16].copy_from_slice(&self.notify_interval_ms.to_le_bytes());
+        b
+    }
+
+    /// Returns `None` for a short buffer or an unknown layout version.
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < SETTINGS_LEN || b[0] != SETTINGS_VERSION {
+            return None;
+        }
+        // The length check above makes the indexing infallible.
+        let word = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Some(Self {
+            pwr_en: b[1] & SFLAG_PWR_EN != 0,
+            wio_sleep: b[1] & SFLAG_WIO_SLEEP != 0,
+            gps_sleep: b[1] & SFLAG_GPS_SLEEP != 0,
+            sleep_interval_s: word(4),
+            stow_interval_s: word(8),
+            notify_interval_ms: word(12),
+        })
+    }
+}
+
 /// `u8` 0/1: enable the GPS/LoRa power rail (AP2112K LDO on GPIO2).
 /// 0 powers off both the WIO-E5 and the GPS entirely.
 pub const CFG_PWR_EN: u8 = 0x10;
@@ -124,10 +198,51 @@ mod tests {
         assert_eq!(to_u128(super::BULK_UUID), super::BULK_UUID_U128);
         assert_eq!(to_u128(super::REMOTE_UUID), super::REMOTE_UUID_U128);
         assert_eq!(to_u128(super::LOG_UUID), super::LOG_UUID_U128);
+        assert_eq!(to_u128(super::SETTINGS_UUID), super::SETTINGS_UUID_U128);
         // Same service as the C3 beacon, different characteristic ids.
         assert!(str_eq(
             gps_proto::packet::SERVICE_UUID,
             "c3a10001-9f6e-4b2c-8f5a-2e32c3b1e5d0"
         ));
+    }
+
+    #[test]
+    fn settings_roundtrip() {
+        let s = super::Settings {
+            pwr_en: true,
+            wio_sleep: false,
+            gps_sleep: true,
+            sleep_interval_s: 300,
+            stow_interval_s: 43200,
+            notify_interval_ms: 1000,
+        };
+        let bytes = s.encode();
+        assert_eq!(bytes.len(), super::SETTINGS_LEN);
+        assert_eq!(super::Settings::decode(&bytes), Some(s));
+    }
+
+    #[test]
+    fn settings_defaults_roundtrip() {
+        let s = super::Settings::default();
+        assert_eq!(super::Settings::decode(&s.encode()), Some(s));
+    }
+
+    #[test]
+    fn settings_rejects_short_and_wrong_version() {
+        let good = super::Settings::default().encode();
+        assert!(super::Settings::decode(&good[..super::SETTINGS_LEN - 1]).is_none());
+        let mut bad = good;
+        bad[0] = super::SETTINGS_VERSION + 1;
+        assert!(super::Settings::decode(&bad).is_none());
+    }
+
+    /// A longer buffer must still decode: a future layout can only grow,
+    /// and byte 0 is what gates compatibility.
+    #[test]
+    fn settings_tolerates_trailing_bytes() {
+        let good = super::Settings::default().encode();
+        let mut longer = [0u8; super::SETTINGS_LEN + 4];
+        longer[..super::SETTINGS_LEN].copy_from_slice(&good);
+        assert!(super::Settings::decode(&longer).is_some());
     }
 }

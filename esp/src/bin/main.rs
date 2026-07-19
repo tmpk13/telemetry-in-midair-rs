@@ -314,6 +314,21 @@ fn nvs_init(flash_periph: esp_hal::peripherals::FLASH<'static>, table_buf: &mut 
     FLASH.lock(|f| f.borrow_mut().replace(flash));
 }
 
+/// Snapshot of everything the config characteristic can change, for the
+/// readable settings characteristic. There is no other way for an app to
+/// learn the device's current state on connect.
+fn current_settings() -> ble::Settings {
+    let p = persist_get();
+    ble::Settings {
+        pwr_en: p.flags & PFLAG_PWR_OFF == 0,
+        wio_sleep: p.flags & PFLAG_WIO_SLEEP != 0,
+        gps_sleep: p.flags & PFLAG_GPS_SLEEP != 0,
+        sleep_interval_s: p.sleep_interval_s,
+        stow_interval_s: p.stow_interval_s,
+        notify_interval_ms: NOTIFY_INTERVAL_MS.lock(|c| c.get()),
+    }
+}
+
 /// Interval for the next deep sleep, 0 = stay awake and keep advertising.
 /// Stow wins while armed so a stowed board keeps its long interval even
 /// though the routine wake-check setting is still stored underneath it.
@@ -807,6 +822,10 @@ struct GpsService {
     /// Latest WIO status/log line (ASCII text).
     #[characteristic(uuid = ble::LOG_UUID_U128, read, notify)]
     log: heapless::Vec<u8, 64>,
+    /// Current power/sleep settings, so an app can populate its controls
+    /// on connect instead of assuming defaults.
+    #[characteristic(uuid = ble::SETTINGS_UUID_U128, read, notify)]
+    settings: [u8; ble::SETTINGS_LEN],
 }
 
 // Default app descriptor required by the esp-idf 2nd-stage bootloader.
@@ -927,6 +946,13 @@ async fn main(spawner: Spawner) -> ! {
         appearance: &appearance::sensor::GENERIC_SENSOR,
     }))
     .expect("gatt server");
+
+    // Seed the readable value so a central that reads immediately after
+    // discovery cannot beat the first publish in `gatt_session`.
+    let _ = server
+        .gps
+        .settings
+        .set(&server, &current_settings().encode());
 
     select(
         ble_host_task(&mut runner),
@@ -1070,6 +1096,18 @@ async fn serve_task<C: Controller>(
     }
 }
 
+/// Refresh the settings characteristic and notify the central. Covers
+/// changes the device makes on its own (a clamped interval, stow disarmed
+/// by a connect), not just ones the app asked for.
+async fn publish_settings<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    let value = current_settings().encode();
+    if server.gps.settings.set(server, &value).is_err() {
+        return;
+    }
+    // An unsubscribed central is not an error - the value stays readable.
+    let _ = server.gps.settings.notify(conn, &value).await;
+}
+
 /// One in-flight bulk transfer (TOML config or WIO firmware).
 struct BulkState {
     kind: u8,
@@ -1085,6 +1123,10 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
     // live events, not a stale backlog.
     while LOG_CHANNEL.try_receive().is_ok() {}
 
+    // The device may have changed things since the last session (stow
+    // disarmed by this very connect), so publish before serving.
+    publish_settings(server, conn).await;
+
     let events = async {
         let mut bulk: Option<BulkState> = None;
         loop {
@@ -1095,6 +1137,9 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
                     if let GattEvent::Write(write) = &event {
                         if write.handle() == server.gps.config.handle {
                             ack = Some(apply_config(write.data()).await);
+                            // Republish: the applied value may differ from
+                            // the requested one after clamping.
+                            publish_settings(server, conn).await;
                             blink(Blink::Info);
                         } else if write.handle() == server.gps.bulk.handle {
                             ack = Some(handle_bulk(write.data(), &mut bulk).await);

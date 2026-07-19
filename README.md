@@ -118,6 +118,13 @@ mis-wired WIO shows on the console instead of just going silent. The
 `verbose` cargo feature adds a line per inbound WIO frame and per heartbeat
 ping (`cargo run --release --features verbose`).
 
+The settings characteristic (`c3a10009-...`, read + notify) carries the
+device's current power/sleep configuration as one 16-byte blob
+(`midair_proto::ble::Settings`), so an app can populate its controls on
+connect rather than assuming defaults. It is republished after every
+config write - including values the device changed itself, such as a
+clamped interval or stow being disarmed by the connect.
+
 Config command ids (config characteristic, `[id, len, value]`):
 
 | Id | Value | Effect |
