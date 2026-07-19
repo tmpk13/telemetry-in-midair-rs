@@ -236,3 +236,12 @@ past the console text. Only one transfer (BLE or USB) runs at a time.
 
 Inital WIO wipe:
 `openocd -f interface/cmsis-dap.cfg -f target/stm32wlx.cfg -c "init; reset halt; stm32l4x unlock 0; reset halt; exit"`
+
+
+
+
+## Charging IC 
+
+`MCP73831T-2ACI/OT`
+4.2 V
+Adjustable current. 500 mA @ 2k ohm programming resistor.

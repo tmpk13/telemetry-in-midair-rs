@@ -1,0 +1,55 @@
+# RADIO.TOML - WIO-E5 configuration reference.
+#
+# Copy this file to the SD card root as RADIO.TOML (uppercase). The WIO
+# loads it at boot; the same file can be pushed over BLE at runtime, which
+# also rewrites the SD copy.
+#
+# Every key is optional - an absent key keeps the default shown in
+# parentheses, and an empty file is valid. Unknown keys are ignored, so
+# newer keys are safe to leave in a file read by older firmware. Section
+# headers are cosmetic: keys are unique across sections, so a key works
+# regardless of which [section] it sits under.
+#
+# The values below are the firmware defaults.
+
+# -- Radio --------------------------------------------------------------
+# These five keys are the LoRa link-budget knobs: together they set
+# sensitivity, on-air time, and radiated power - i.e. range.
+[radio]
+frequency_hz = 915000000   # RF center frequency, 150000000-960000000 (915 MHz)
+spreading_factor = 7       # 5-12; higher = longer range, slower (7)
+bandwidth_khz = 125        # 62|125|250|500 (62 means 62.5); narrower = longer range (125)
+coding_rate = 5            # 4/5..4/8 as 5-8; higher = more FEC, slower (5)
+power_dbm = 22             # TX power, -9..22 on the high-power PA (22)
+
+# Low-data-rate optimization is derived automatically from spreading
+# factor and bandwidth; there is no key for it.
+
+# -- Mesh ---------------------------------------------------------------
+[mesh]
+address = 1                # this node's mesh address, 1-255 (1)
+listen_ms = 200            # channel listen window before TX, 10-60000 (200)
+lifetime = 2               # broadcast hop count, 1-16; >=2 makes nodes repeat (2)
+
+# Raise listen_ms alongside slow presets (SF12, narrow bandwidth): the
+# listen window must exceed one packet's air time.
+
+# -- Beacon -------------------------------------------------------------
+[beacon]
+interval_s = 10            # position broadcast period in seconds, 0-3600; 0 = off (10)
+
+# -- GPS ----------------------------------------------------------------
+# MAX-M10 receiver, applied as one UBX-CFG-VALSET to the RAM layer. An
+# absent [gps] section leaves the module at its factory concurrent set.
+[gps]
+gps_enabled = true         # (true)
+glonass_enabled = false    # (false); the M10 tracks a limited concurrent set
+galileo_enabled = true     # (true)
+beidou_enabled = true      # (true)
+qzss_enabled = true        # (true)
+sbas_enabled = true        # (true)
+power_mode = "full"        # full|psmoo|psmct (full)
+                           #   psmoo = power-save on/off, psmct = cyclic tracking
+meas_rate_ms = 1000        # measurement/nav period, 25-10000 (1000)
+dynamic_model = "portable" # portable|stationary|pedestrian|automotive|
+                           #   sea|airborne1g|airborne2g|airborne4g (portable)
