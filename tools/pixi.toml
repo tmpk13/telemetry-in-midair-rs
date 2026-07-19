@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "midair-tools"
 version = "0.1.0"
 description = "Host tools for the telemetry-in-midair board"
