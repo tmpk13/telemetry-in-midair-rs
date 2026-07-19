@@ -150,10 +150,15 @@ powers the WIO or GPS at all. The rail comes up only when a central
 actually connects (and only if `0x10` has it enabled), so the app should
 expect the WIO's boot time plus a GPS cold TTFF after connecting.
 
-Both intervals live in RTC RAM: they survive deep sleep, not a power
-cycle. The wake is timed by the C6's uncalibrated RC slow clock, so a
-multi-hour stow can drift by tens of minutes - it paces a wake-check,
-not a schedule.
+Both intervals, and the `0x10` rail setting, are held in RTC RAM and
+mirrored to the ESP's `nvs` flash partition, so they survive deep sleep
+*and* a flat battery - a board stowed for transport comes back stowed
+rather than advertising until the cell dies again. Flash is read only on
+a cold boot; wake checks run from the RTC RAM copy.
+
+The wake is timed by the C6's uncalibrated RC slow clock, so a multi-hour
+stow can drift by tens of minutes - it paces a wake-check, not a
+schedule.
 
 ## SD card
 

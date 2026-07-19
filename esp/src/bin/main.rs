@@ -44,7 +44,10 @@ use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
+use esp_bootloader_esp_idf::partitions::{self, DataPartitionSubType, PartitionType};
 use esp_hal::gpio::{DriveMode, Level, Output, OutputConfig, RtcPin};
+use esp_storage::{FlashStorage, FlashStorageError};
 use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::timer::timg::TimerGroup;
@@ -194,6 +197,123 @@ fn persist_update(f: impl FnOnce(&mut Persist)) {
     PERSIST_MAGIC_WORD.store(PERSIST_MAGIC, PersistOrdering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Settings that survive a power cycle (flash, on top of the RTC RAM copy)
+// ---------------------------------------------------------------------------
+
+// RTC RAM is lost when the cell goes flat, so a stowed board would come
+// back with nothing configured and advertise at ~35 mA until it died
+// again. The same three words are therefore mirrored into flash, which
+// RTC RAM then caches: only a cold boot reads flash, so the wake-check
+// path stays free of it.
+//
+// This claims the `nvs` data partition but does NOT use the ESP-IDF NVS
+// key/value format - it is one fixed record at the partition start, and
+// nothing else on this board reads the region. Saves are app-driven
+// (rare), so rewriting the sector each time costs nothing in wear.
+
+const NVS_MAGIC: u32 = 0x6D69_6441; // "midA"
+const NVS_VERSION: u32 = 1;
+/// magic, version, sleep, stow, flags, crc32 - all u32, so the length is
+/// already a multiple of the flash write word.
+const NVS_RECORD_LEN: usize = 24;
+
+/// Resolved `nvs` partition offset, 0 = lookup failed (no partition table
+/// or no such partition). Settings then degrade to RTC RAM only.
+static NVS_OFFSET: PersistU32 = PersistU32::new(0);
+
+static FLASH: Mutex<CriticalSectionRawMutex, RefCell<Option<FlashStorage<'static>>>> =
+    Mutex::new(RefCell::new(None));
+
+fn nvs_encode(p: &Persist) -> [u8; NVS_RECORD_LEN] {
+    let mut rec = [0u8; NVS_RECORD_LEN];
+    rec[0..4].copy_from_slice(&NVS_MAGIC.to_le_bytes());
+    rec[4..8].copy_from_slice(&NVS_VERSION.to_le_bytes());
+    rec[8..12].copy_from_slice(&p.sleep_interval_s.to_le_bytes());
+    rec[12..16].copy_from_slice(&p.stow_interval_s.to_le_bytes());
+    rec[16..20].copy_from_slice(&p.flags.to_le_bytes());
+    let crc = link::crc32(&rec[0..20]);
+    rec[20..24].copy_from_slice(&crc.to_le_bytes());
+    rec
+}
+
+fn nvs_decode(rec: &[u8; NVS_RECORD_LEN]) -> Option<Persist> {
+    let word = |i: usize| u32::from_le_bytes(rec[i..i + 4].try_into().unwrap());
+    if word(0) != NVS_MAGIC || word(4) != NVS_VERSION {
+        return None;
+    }
+    if word(20) != link::crc32(&rec[0..20]) {
+        return None;
+    }
+    Some(Persist {
+        sleep_interval_s: word(8),
+        stow_interval_s: word(12),
+        flags: word(16),
+    })
+}
+
+/// Read the saved settings. Called once on a cold boot; a deep-sleep wake
+/// has a valid RTC RAM copy and never touches flash.
+fn nvs_load() -> Option<Persist> {
+    let offset = NVS_OFFSET.load(PersistOrdering::Relaxed);
+    if offset == 0 {
+        return None;
+    }
+    FLASH.lock(|f| {
+        let mut f = f.borrow_mut();
+        let flash = f.as_mut()?;
+        let mut rec = [0u8; NVS_RECORD_LEN];
+        ReadNorFlash::read(flash, offset, &mut rec).ok()?;
+        nvs_decode(&rec)
+    })
+}
+
+/// Persist the current settings. Erases the record's sector first, since
+/// NOR flash only clears bits on write.
+fn nvs_save() {
+    let offset = NVS_OFFSET.load(PersistOrdering::Relaxed);
+    if offset == 0 {
+        return;
+    }
+    let rec = nvs_encode(&persist_get());
+    let result = FLASH.lock(|f| {
+        let mut f = f.borrow_mut();
+        let Some(flash) = f.as_mut() else {
+            return Err(FlashStorageError::IoError);
+        };
+        let sector = FlashStorage::SECTOR_SIZE;
+        NorFlash::erase(flash, offset, offset + sector)?;
+        NorFlash::write(flash, offset, &rec)
+    });
+    if result.is_err() {
+        // Non-fatal: the RTC RAM copy still drives this power cycle, only
+        // the survive-a-flat-battery guarantee is lost.
+        println!("nvs: save failed, settings are volatile this session");
+    }
+}
+
+/// Locate the `nvs` partition and adopt any saved settings. Flash reads
+/// need the partition table, which is why this runs from `main` (a 3 KiB
+/// buffer) rather than from the settings helpers.
+fn nvs_init(flash_periph: esp_hal::peripherals::FLASH<'static>, table_buf: &mut [u8]) {
+    let mut flash = FlashStorage::new(flash_periph);
+    let offset = match partitions::read_partition_table(&mut flash, table_buf) {
+        Ok(table) => match table.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) {
+            Ok(Some(entry)) => entry.offset(),
+            _ => {
+                println!("nvs: no nvs partition, settings will not survive a power cycle");
+                0
+            }
+        },
+        Err(_) => {
+            println!("nvs: no partition table, settings will not survive a power cycle");
+            0
+        }
+    };
+    NVS_OFFSET.store(offset, PersistOrdering::Relaxed);
+    FLASH.lock(|f| f.borrow_mut().replace(flash));
+}
+
 /// Interval for the next deep sleep, 0 = stay awake and keep advertising.
 /// Stow wins while armed so a stowed board keeps its long interval even
 /// though the routine wake-check setting is still stored underneath it.
@@ -250,6 +370,7 @@ fn set_pwr_en(on: bool) {
             p.flags |= PFLAG_PWR_OFF;
         }
     });
+    nvs_save();
 }
 
 /// Hard-reset the WIO-E5 (NRST low pulse through the open-drain GPIO6).
@@ -704,6 +825,24 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
+    // Flash-backed settings. The table buffer is heap-scoped: it is 3 KiB,
+    // wanted once, and too big to risk on the task stack.
+    {
+        let mut table_buf = alloc::vec![0u8; partitions::PARTITION_TABLE_MAX_LEN];
+        nvs_init(peripherals.FLASH, &mut table_buf);
+    }
+    // A deep-sleep wake still holds its RTC RAM copy, so only a cold boot
+    // (or a lost one) pays for the flash read.
+    if PERSIST_MAGIC_WORD.load(PersistOrdering::Relaxed) != PERSIST_MAGIC {
+        if let Some(saved) = nvs_load() {
+            persist_update(|p| *p = saved);
+            println!(
+                "nvs: restored sleep {} s, stow {} s, flags {:#x}",
+                saved.sleep_interval_s, saved.stow_interval_s, saved.flags
+            );
+        }
+    }
+
     let persist = persist_get();
     let woke_from_sleep = matches!(
         esp_hal::system::wakeup_cause(),
@@ -902,6 +1041,7 @@ async fn serve_task<C: Controller>(
         // this session ends.
         if persist_get().stow_interval_s > 0 {
             persist_update(|p| p.stow_interval_s = 0);
+            nvs_save();
             qprintln!("stow disarmed by connect");
         }
         // The rail is dark on every wake check; raise it now if that is
@@ -1095,6 +1235,7 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                         secs = secs.clamp(ble::ESP_SLEEP_MIN_S, ble::ESP_SLEEP_MAX_S);
                     }
                     persist_update(|p| p.sleep_interval_s = secs);
+                    nvs_save();
                     qprintln!("config: esp sleep interval {} s", secs);
                     return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
                 }
@@ -1107,6 +1248,9 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                         secs = secs.clamp(ble::ESP_STOW_MIN_S, ble::ESP_STOW_MAX_S);
                     }
                     persist_update(|p| p.stow_interval_s = secs);
+                    // Written before the sleep, so a cell that goes flat
+                    // mid-stow still comes back stowed.
+                    nvs_save();
                     if secs > 0 {
                         // Ack first: arming ends this session, so the write
                         // would otherwise go unanswered.
