@@ -1,6 +1,6 @@
 # V1
 
-Pin 28 on WIO should be NC
+Pin 28 on WIO should be NC. Paint over with mask for v1?
 SMA wrong footprint 
 
 Maybe need a larger capacitor on WIO-E5 input? Check this.
