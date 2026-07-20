@@ -29,6 +29,7 @@ macro_rules! status_println {
 }
 
 pub mod boot_state;
+pub mod cfgstore;
 pub mod cfgxfer;
 pub mod esplink;
 pub mod fwupdate;

@@ -9,8 +9,11 @@ Other keys go through --set, repeatably:
 
     pixi run wio-config --address 3 --set role=tx_only --set interval_s=30
 
-The board applies the config immediately and rewrites its SD copy, so the
-change survives a reboot; nothing has to be reflashed.
+The board applies the config immediately and stores it in two places - the
+SD card's RADIO.CFG and a backup page in the WIO's internal flash - so the
+change survives a power cycle with or without a card. Nothing is reflashed.
+The board reports which stores it reached, and this exits non-zero if it
+reached neither.
 
 IMPORTANT - this sends a whole file, not a patch. The firmware parses a
 config starting from its own defaults, so any key absent from what is sent
@@ -200,15 +203,23 @@ def main() -> int:
                  "rejected: a value out of range or a string that is not one "
                  "of the choices. Check it with --dry-run.")
 
-    # The WIO logs "config applied, node N" once it has parsed and adopted
-    # the file, which is the only read-back there is: an ack proves the
-    # bytes arrived, this proves which address is now live.
+    # The WIO logs "config applied, node N, <where it was saved>" once it has
+    # parsed and adopted the file, which is the only read-back there is: an
+    # ack proves the bytes arrived, this proves which address is now live and
+    # whether it will still be there after a power cycle.
     applied = link.read_console(ser, "config applied", timeout=3.0)
-    if applied:
-        print(applied)
-    else:
+    if not applied:
         print("config accepted (no 'config applied' line seen; it may have "
               "scrolled past - the transfer itself was acked)")
+        return 0
+
+    print(applied)
+    if "NOT SAVED" in applied:
+        print("\nWARNING: the config is live but reached neither the SD card "
+              "nor the flash backup.\nIt will be lost on the next power "
+              "cycle, reverting to firmware defaults.\nCheck that the card is "
+              "seated and readable, or that flash is not worn out.")
+        return 2
     return 0
 
 

@@ -4,7 +4,9 @@
  *   Bootloader   pages  0– 7   16 KB  0x0800_0000
  *   ACTIVE (app) pages  8–63  112 KB  0x0800_4000  ← this binary
  *   DFU staging  pages 64–120 114 KB  0x0802_0000
- *   Boot state   pages 121–127 14 KB  0x0803_C800
+ *   Boot state   page  121      2 KB  0x0803_C800
+ *   Radio config page  122      2 KB  0x0803_D000  (see src/cfgstore.rs)
+ *   Spare        pages 123–127 10 KB  0x0803_D800
  */
 MEMORY
 {

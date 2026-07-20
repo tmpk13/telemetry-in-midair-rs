@@ -36,6 +36,7 @@ mod app {
         pac::{FLASH, IWDG},
         subghz::SubGhz,
     };
+    use wio_e5_gps::cfgstore;
     use wio_e5_gps::cfgxfer::{CfgEvent, CfgTransfer};
     use wio_e5_gps::esplink::{self, EspLink, RxProducer, RxQueue};
     use wio_e5_gps::fwupdate::{FwEvent, FwUpdate};
@@ -118,23 +119,35 @@ mod app {
         sdlog.poll(platform::millis());
         watchdog::feed(&iwdg);
 
-        // Radio config: SD file if present, defaults otherwise.
+        // Radio config: the SD file, else the flash backup, else defaults.
+        // The card wins when both exist - pulling it to edit RADIO.CFG on a
+        // computer has to do what it looks like it does - and the flash copy
+        // is what carries a board with no card across a power cycle.
         let mut cfg_buf = [0u8; wio_e5_gps::sdlog::CONFIG_MAX];
-        let (cfg, cfg_loaded) = match sdlog.read_config(&mut cfg_buf) {
-            Some(n) => match radiocfg::parse_bytes(&cfg_buf[..n]) {
-                Ok(c) => {
-                    rprintln!("Config: RADIO.CFG loaded (address {})", c.address);
+        let from_sd = sdlog
+            .read_config(&mut cfg_buf)
+            .and_then(|n| match radiocfg::parse_bytes(&cfg_buf[..n]) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    rprintln!("Config: RADIO.CFG invalid ({:?}), trying flash", e);
+                    None
+                }
+            });
+        let (cfg, cfg_loaded) = match from_sd {
+            Some(c) => {
+                rprintln!("Config: RADIO.CFG loaded (address {})", c.address);
+                (c, true)
+            }
+            None => match cfgstore::read(&mut cfg_buf).and_then(|n| radiocfg::parse_bytes(&cfg_buf[..n]).ok()) {
+                Some(c) => {
+                    rprintln!("Config: flash backup loaded (address {})", c.address);
                     (c, true)
                 }
-                Err(e) => {
-                    rprintln!("Config: RADIO.CFG invalid ({:?}), using defaults", e);
+                None => {
+                    rprintln!("Config: none stored, using defaults");
                     (RadioConfig::default(), false)
                 }
             },
-            None => {
-                rprintln!("Config: no SD config, using defaults");
-                (RadioConfig::default(), false)
-            }
         };
         // Honor sd_enabled only now: the setting itself lives on the card,
         // so the card has to be read before it can say to stop using it.
@@ -305,11 +318,27 @@ mod app {
                                     status_println!(esp, "gps reconfigured");
                                 }
                                 *cfg_loaded = true;
-                                // Best effort - the SD card is optional.
-                                if !sdlog.write_config(now, cfgxfer.bytes()) {
-                                    rprintln!("Config applied; SD save failed");
-                                }
-                                status_println!(esp, "config applied, node {}", cfg.address);
+                                // Both stores are best effort, but a config
+                                // that reached neither is gone at the next
+                                // power cycle - and that has to reach the
+                                // host, which sees only what goes over the
+                                // link. An RTT-only warning left a push
+                                // looking successful right up until a reboot
+                                // quietly restored the defaults.
+                                let sd_ok = sdlog.write_config(now, cfgxfer.bytes());
+                                let flash_ok = cfgstore::write(flash, cfgxfer.bytes());
+                                let stored = match (sd_ok, flash_ok) {
+                                    (true, true) => "saved to SD and flash",
+                                    (true, false) => "saved to SD only",
+                                    (false, true) => "saved to flash only (no SD)",
+                                    (false, false) => "NOT SAVED - lost on reboot",
+                                };
+                                status_println!(
+                                    esp,
+                                    "config applied, node {}, {}",
+                                    cfg.address,
+                                    stored
+                                );
                                 esp.send_ack(cmd::CFG_END, 0);
                             }
                             Err(_) => esp.send_nak(cmd::CFG_END, link::err::BAD_CONFIG),

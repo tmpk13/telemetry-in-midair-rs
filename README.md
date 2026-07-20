@@ -64,6 +64,12 @@ their defaults rather than keeping the board's current values, and there is
 no way to read a config back off a board. Start from a file holding your
 settings (`--file`) if the board is not on stock ones.
 
+A pushed config is stored twice - `RADIO.CFG` on the card and a backup page
+in the WIO's internal flash - so it survives a power cycle on a board with
+no SD card. The card wins at boot, so editing `RADIO.CFG` on a computer
+still works. The board reports which stores it reached, and `wio-config`
+exits non-zero if a config went live but reached neither.
+
 Note the WIO only has power while the ESP drives the LDO enable
 (GPIO2) high - flash the ESP first or SWD/UART on the WIO will see a
 dead chip.
