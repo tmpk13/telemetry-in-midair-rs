@@ -462,6 +462,18 @@ mod tests {
         assert_eq!(parse("# just a comment\n\n").unwrap(), RadioConfig::default());
     }
 
+    /// RADIO.example.toml states in its header that its values are the
+    /// firmware defaults, and it is written by hand, so nothing but this
+    /// makes that true. It is also what gps-gui-rs lays down for a board with
+    /// no config yet: since the app writes every key explicitly, a stale value
+    /// here is not corrected by the default it drifted from - it silently
+    /// becomes the board's setting.
+    #[test]
+    fn example_file_documents_the_real_defaults() {
+        let example = include_str!("../../RADIO.example.toml");
+        assert_eq!(parse(example).unwrap(), RadioConfig::default());
+    }
+
     #[test]
     fn full_file() {
         let toml = r#"
