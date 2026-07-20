@@ -138,6 +138,15 @@ pub const TELEM_FLAG_SD_OK: u8 = 0x01;
 pub const TELEM_FLAG_GPS_FIX: u8 = 0x02;
 /// Set when the radio config was loaded from SD/UART (not defaults).
 pub const TELEM_FLAG_CFG_LOADED: u8 = 0x04;
+/// Set when the config asks for verbose console logging.
+///
+/// The ESP never sees the config file - it streams the bytes through to the
+/// WIO without parsing them - so the WIO relays this one setting back as a
+/// flag bit. Riding on the periodic telemetry rather than a command of its
+/// own means the ESP re-learns it every few seconds, so a bit lost to a
+/// garbled frame corrects itself and a mid-session config push takes effect
+/// without either side tracking whether it was delivered.
+pub const TELEM_FLAG_VERBOSE: u8 = 0x08;
 
 pub const TELEMETRY_LEN: usize = 16;
 
@@ -443,7 +452,7 @@ mod tests {
             secs_since_rx: 12,
             rx_count: 100_000,
             tx_count: 42,
-            flags: TELEM_FLAG_SD_OK | TELEM_FLAG_GPS_FIX,
+            flags: TELEM_FLAG_SD_OK | TELEM_FLAG_GPS_FIX | TELEM_FLAG_VERBOSE,
             sats: 11,
         };
         let b = t.encode();

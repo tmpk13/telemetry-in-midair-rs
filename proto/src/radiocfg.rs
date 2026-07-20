@@ -261,6 +261,16 @@ pub struct RadioConfig {
     /// Whether the SD card is used at all. False stops logging, config
     /// read-back and the card's power draw.
     pub sd_enabled: bool,
+    /// Verbose console logging on the ESP: per-frame link traffic and
+    /// per-heartbeat detail, on top of the events that are always logged.
+    ///
+    /// On by default, since the console costs nothing when nobody is
+    /// attached to it. Turn it off for a quiet log, or when a tool is
+    /// parsing the console and the extra lines are in the way.
+    ///
+    /// The ESP does not parse this file, so the setting reaches it as
+    /// [`crate::link::TELEM_FLAG_VERBOSE`] in the WIO's periodic telemetry.
+    pub verbose: bool,
     /// Use the internal DC-DC (SMPS) rather than the LDO, roughly halving
     /// RX and TX current at 3.3 V.
     ///
@@ -306,6 +316,10 @@ impl Default for RadioConfig {
             // air time that has to be paid on every single broadcast.
             beacon_fields: crate::lora::FIELDS_DEFAULT,
             sd_enabled: true,
+            // The console is free when nothing is reading it, so the
+            // detailed build is the one to ship and quieting it is the
+            // deliberate choice.
+            verbose: true,
             // The Wio-E5 carries the SMPS inductor and a 1.8 V TCXO; these
             // defaults are that module's hardware, not a tuning choice.
             dcdc_enabled: true,
@@ -517,6 +531,8 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             }
             // -- [sd] -------------------------------------------------------
             "sd_enabled" => cfg.sd_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            // -- [debug] ----------------------------------------------------
+            "verbose" => cfg.verbose = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
             // -- [gps] ------------------------------------------------------
             "gps_enabled" => cfg.gps.gps_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
             "glonass_enabled" => cfg.gps.glonass_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
@@ -826,6 +842,16 @@ mod tests {
         assert_eq!(parse("tcxo_volts = \"5.0\""), Err(ConfigError::BadValue(1)));
         assert_eq!(parse("tcxo_startup_ms = 0"), Err(ConfigError::OutOfRange(1)));
         assert_eq!(parse("tcxo_startup_ms = 2000"), Err(ConfigError::OutOfRange(1)));
+    }
+
+    /// The ESP has no copy of the config, so this key only reaches it as a
+    /// telemetry flag bit - see [`crate::link::TELEM_FLAG_VERBOSE`].
+    #[test]
+    fn verbose_defaults_on_and_can_be_turned_off() {
+        assert!(RadioConfig::default().verbose);
+        assert!(!parse("verbose = false").unwrap().verbose);
+        assert!(parse("verbose = true").unwrap().verbose);
+        assert_eq!(parse("verbose = quiet"), Err(ConfigError::BadValue(1)));
     }
 
     #[test]

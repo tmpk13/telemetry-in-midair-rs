@@ -24,7 +24,8 @@ and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
 **Using Pixi**
 From `tools/` directory run
 `pixi run esp-upload`
-`pixi run wio-upload`
+`pixi run wio-upload --address <#>`
+
 
 **Directly running**
 ```sh
@@ -36,12 +37,32 @@ cd wio && cargo run --release -p bootloader   # no RTT output; Ctrl-C once flash
 cd wio && cargo run --release                 # app, RTT console
 
 # ESP32-C6 (USB Serial/JTAG; console also lives there)
+# Per-frame link + per-heartbeat logging is on by default.
 cd esp && cargo run --release
-# ...with per-frame link + per-heartbeat logging:
-cd esp && cargo run --release --features verbose
 # same thing from the tools env:
 cd tools && pixi run esp-upload
+# compile the verbose call sites out entirely (code size, not logging):
+cd esp && cargo run --release --no-default-features
 ```
+
+## Configuring a board
+
+`RADIO.example.toml` documents every setting. It is a reference, not a card
+file - the firmware reads at most 1024 bytes of config and the descriptions
+put it well over that, so the tool strips them before sending.
+
+```sh
+cd tools
+pixi run wio-config --address 3                  # applied live, saved to SD
+pixi run wio-config --set role=rx_only           # any key, repeatable
+pixi run wio-config --set verbose=false          # quiet the ESP console
+pixi run wio-config --address 3 --dry-run --save ../RADIO.CFG   # card file
+```
+
+A push replaces the whole config: keys absent from what is sent revert to
+their defaults rather than keeping the board's current values, and there is
+no way to read a config back off a board. Start from a file holding your
+settings (`--file`) if the board is not on stock ones.
 
 Note the WIO only has power while the ESP drives the LDO enable
 (GPIO2) high - flash the ESP first or SWD/UART on the WIO will see a

@@ -26,5 +26,6 @@ wio-upload = "python wio_fw_upload.py"
 wio-config = "python wio_config.py"
 
 # Build and flash the ESP32-C6 over its USB Serial/JTAG port, then stay
-# attached to the console (verbose: per-frame link and heartbeat logs).
-esp-upload = { cmd = "cargo run --release --features verbose", cwd = "../esp" }
+# attached to the console. Per-frame link and heartbeat logging is on by
+# default; quiet it at runtime with `wio-config --set verbose=false`.
+esp-upload = { cmd = "cargo run --release", cwd = "../esp" }

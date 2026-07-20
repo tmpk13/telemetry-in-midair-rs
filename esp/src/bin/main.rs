@@ -75,12 +75,17 @@ macro_rules! qprintln {
     };
 }
 
-/// Like [`qprintln!`] but only emits when the `verbose` cargo feature is on.
-/// The arguments are always type-checked; the call is dead-code eliminated
-/// in a non-verbose build.
+/// Like [`qprintln!`] but only for per-frame and per-heartbeat detail.
+///
+/// Gated twice. The `verbose` cargo feature decides whether these calls are
+/// compiled in at all - it is on by default, and turning it off dead-code
+/// eliminates them while still type-checking the arguments. Within such a
+/// build, [`verbose_enabled`] is the runtime switch the `verbose` config key
+/// drives, so the console can be quieted on a deployed board without
+/// reflashing one.
 macro_rules! vprintln {
     ($($arg:tt)*) => {
-        if cfg!(feature = "verbose") && !console_busy() {
+        if cfg!(feature = "verbose") && verbose_enabled() && !console_busy() {
             ::esp_println::println!($($arg)*);
         }
     };
@@ -492,6 +497,21 @@ static LINK_LOCK: AsyncMutex<CriticalSectionRawMutex, ()> = AsyncMutex::new(());
 /// firmware stream.
 static FW_XFER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Whether the config asks for verbose console logging.
+///
+/// The ESP never parses the config file - it forwards the bytes to the WIO
+/// unread - so this tracks [`link::TELEM_FLAG_VERBOSE`] out of the WIO's
+/// periodic telemetry. It starts true so a board boots talkative and stays
+/// that way until the WIO says otherwise; that also means the console is
+/// verbose during the window before the first heartbeat, which is exactly
+/// when a board that fails to come up needs to be saying something.
+static VERBOSE: AtomicBool = AtomicBool::new(true);
+
+/// Whether verbose console lines should be emitted right now.
+fn verbose_enabled() -> bool {
+    VERBOSE.load(PersistOrdering::Relaxed)
+}
+
 /// Whether console output must stay quiet.
 ///
 /// esp-println and the USB reply frames share the single 64-byte USB
@@ -633,6 +653,10 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
         }
         msg::STATUS => {
             if let Some(t) = Telemetry::decode(payload) {
+                // Adopt the console verbosity the WIO's config asks for.
+                // Done before the line below, so the heartbeat that carries
+                // a change is already logged under the new setting.
+                VERBOSE.store(t.flags & link::TELEM_FLAG_VERBOSE != 0, PersistOrdering::Relaxed);
                 vprintln!(
                     "wio telem: sats={} fix={} rssi={} snr_cb={} rx={} tx={} flags=0x{:02x}",
                     t.sats,

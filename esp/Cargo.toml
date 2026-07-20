@@ -9,10 +9,15 @@ name = "esp32c6-gps"
 path = "./src/bin/main.rs"
 
 [features]
-default = []
+default = ["verbose"]
 # Extra console logging: every WIO link frame, decoded GPS position /
 # remote / telemetry, and each heartbeat ping (link up/down transitions
-# are always logged). Build with `cargo run --release --features verbose`.
+# are always logged).
+#
+# On by default - the console costs nothing when nothing is attached to it,
+# and the `verbose` key in RADIO.CFG quiets a deployed board at runtime
+# without a reflash. Build with `--no-default-features` to compile the
+# calls out entirely, which is a code-size choice, not a logging one.
 verbose = []
 
 [dependencies]

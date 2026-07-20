@@ -506,6 +506,11 @@ mod app {
                 if *cfg_loaded {
                     flags |= link::TELEM_FLAG_CFG_LOADED;
                 }
+                // The ESP has no copy of the config, so its console verbosity
+                // rides along here and is refreshed with every heartbeat.
+                if cfg.verbose {
+                    flags |= link::TELEM_FLAG_VERBOSE;
+                }
                 let telem = Telemetry {
                     last_rssi: node.last_rssi(),
                     last_snr_cb: node.radio().last_snr_cb(),

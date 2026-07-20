@@ -26,6 +26,14 @@ settings, pass the file holding them with --file and edit that instead:
     pixi run wio-config --file mynet.toml --address 3
 
 --file also takes the SD card's own RADIO.CFG, which is the same format.
+
+Comments and the `_description`/`_type` documentation keys are stripped
+before sending. They are inert to the firmware, and the reference file is
+several times the 1024-byte ceiling the ESP and WIO both enforce, so this is
+what makes a push fit at all. To produce a card-ready RADIO.CFG without
+sending anything:
+
+    pixi run wio-config --address 3 --dry-run --save ../RADIO.CFG
 """
 
 import argparse
@@ -39,6 +47,11 @@ DEFAULT_CONFIG = link.ROOT / "RADIO.example.toml"
 # The parser on the WIO accepts 1-255; 0 is reserved to mark a packet as not
 # one of ours (see proto/src/lora.rs).
 ADDRESS_MIN, ADDRESS_MAX = 1, 255
+
+# Largest config the firmware will take, enforced in three places that must
+# agree: the ESP's OP_BEGIN check, wio/src/cfgxfer.rs CONFIG_MAX, and the
+# buffer the WIO reads RADIO.CFG into at boot.
+CONFIG_MAX = 1024
 
 
 def set_key(text: str, key: str, value: str) -> tuple[str, bool]:
@@ -63,6 +76,28 @@ def set_key(text: str, key: str, value: str) -> tuple[str, bool]:
     # Not in the file: append it. A key is valid under any section header,
     # so the end of the file is as good a place as any.
     return text.rstrip("\n") + f"\n\n{key} = {value}\n", False
+
+
+def strip_docs(text: str) -> str:
+    """Drop everything the firmware does not read: comments, blank lines and
+    the `<key>_description` / `<key>_type` strings.
+
+    The reference file spends most of its bytes documenting itself for an
+    editor, and the firmware ignores every one of those keys. That matters
+    because CONFIG_MAX is 1024 bytes on both the ESP's begin check and the
+    WIO's transfer buffer, and the documented file is several times that -
+    so this is what makes a push possible at all, not a size optimization.
+    """
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key.endswith("_description") or key.endswith("_type"):
+            continue
+        out.append(stripped)
+    return "\n".join(out) + "\n"
 
 
 def parse_set(arg: str) -> tuple[str, str]:
@@ -129,20 +164,26 @@ def main() -> int:
               "The firmware ignores keys it does not know, so a misspelling "
               "here is accepted and has no effect.")
 
+    # What actually goes on the wire, and what a card copy should hold.
+    text = strip_docs(text)
     data = text.encode()
-    if len(data) > 0xFFFFFFFF:
-        sys.exit("config too large")
+    if len(data) > CONFIG_MAX:
+        sys.exit(
+            f"config is {len(data)} bytes after stripping comments and "
+            f"descriptions, over the firmware's {CONFIG_MAX}-byte limit.\n"
+            "Remove keys that are at their default - an absent key keeps it."
+        )
 
     if args.save:
         args.save.write_text(text)
-        print(f"saved edited config to {args.save}")
+        print(f"saved the config as sent to {args.save}")
 
     if args.dry_run:
-        print(f"--- would send {len(data)} bytes (from {args.file}) ---")
+        print(f"--- would send {len(data)}/{CONFIG_MAX} bytes (from {args.file}) ---")
         print(text, end="")
         return 0
 
-    print(f"sending {len(data)} bytes based on {args.file}")
+    print(f"sending {len(data)}/{CONFIG_MAX} bytes based on {args.file}")
     ser = link.open_port(args.port)
     if not link.ping(ser):
         sys.exit("no PING reply - is the ESP running wio-e5-gps firmware?")

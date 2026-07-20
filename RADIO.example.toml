@@ -1,8 +1,17 @@
 # RADIO.CFG - WIO-E5 configuration reference.
 #
-# Copy this file to the SD card root as RADIO.CFG (uppercase). The WIO
-# loads it at boot; the same file can be pushed over BLE at runtime, which
-# also rewrites the SD copy.
+# This is the reference, not a drop-in card file: the firmware reads at most
+# 1024 bytes of config and the documentation below puts this file several
+# times over that. Strip the comments and the _description/_type keys and
+# what remains is about 500 bytes, which fits. The tools do that for you:
+#
+#   cd tools && pixi run wio-config --address 3                 # push it
+#   cd tools && pixi run wio-config --address 3 --dry-run \
+#                                   --save ../RADIO.CFG         # card file
+#
+# The card file goes in the SD root as RADIO.CFG (uppercase). The WIO loads
+# it at boot; a config pushed over USB or BLE is applied live and rewrites
+# the SD copy.
 #
 # Every key is optional - an absent key keeps its default, and an empty
 # file is valid. Section headers are cosmetic: keys are unique across
@@ -85,6 +94,11 @@ fields_description = "Which GPS fields each broadcast carries: lat, lon, altitud
 [sd]
 sd_enabled = true
 sd_enabled_description = "Use the SD card. false stops position logging and the card's power draw."
+
+# -- Debug --------------------------------------------------------------
+[debug]
+verbose = true
+verbose_description = "Log every link frame and heartbeat on the ESP's USB console, on top of the events that are always logged. Costs nothing when nothing is attached; turn it off for a quiet console or when a tool is parsing it."
 
 # -- GPS ----------------------------------------------------------------
 # MAX-M10 receiver, applied as one UBX-CFG-VALSET to the RAM layer. An
