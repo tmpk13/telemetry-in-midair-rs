@@ -93,9 +93,6 @@ const WAKE_ADV_WINDOW_S: u64 = 15;
 /// Linger after a disconnect (sleep mode active) so the phone can come
 /// straight back before the C6 vanishes.
 const SLEEP_LINGER_S: u64 = 5;
-/// Grace period between acking a stow request and dropping the link, so
-/// the app sees its ack rather than a bare disconnect.
-const STOW_ACK_GRACE_MS: u64 = 500;
 
 // ---------------------------------------------------------------------------
 // Cached state (UART link task writes, BLE session samples)
@@ -153,9 +150,6 @@ const PFLAG_GPS_SLEEP: u32 = 1 << 2;
 #[derive(Clone, Copy)]
 struct Persist {
     sleep_interval_s: u32,
-    /// Extended low-power sleep, armed by `CFG_ESP_STOW_S`. Non-zero
-    /// overrides `sleep_interval_s` until a central connects.
-    stow_interval_s: u32,
     flags: u32,
 }
 
@@ -168,21 +162,17 @@ static PERSIST_MAGIC_WORD: PersistU32 = PersistU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static PERSIST_INTERVAL: PersistU32 = PersistU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
-static PERSIST_STOW: PersistU32 = PersistU32::new(0);
-#[esp_hal::ram(unstable(rtc_fast, persistent))]
 static PERSIST_FLAGS: PersistU32 = PersistU32::new(0);
 
 fn persist_get() -> Persist {
     if PERSIST_MAGIC_WORD.load(PersistOrdering::Relaxed) == PERSIST_MAGIC {
         Persist {
             sleep_interval_s: PERSIST_INTERVAL.load(PersistOrdering::Relaxed),
-            stow_interval_s: PERSIST_STOW.load(PersistOrdering::Relaxed),
             flags: PERSIST_FLAGS.load(PersistOrdering::Relaxed),
         }
     } else {
         Persist {
             sleep_interval_s: 0,
-            stow_interval_s: 0,
             flags: 0,
         }
     }
@@ -192,7 +182,6 @@ fn persist_update(f: impl FnOnce(&mut Persist)) {
     let mut p = persist_get();
     f(&mut p);
     PERSIST_INTERVAL.store(p.sleep_interval_s, PersistOrdering::Relaxed);
-    PERSIST_STOW.store(p.stow_interval_s, PersistOrdering::Relaxed);
     PERSIST_FLAGS.store(p.flags, PersistOrdering::Relaxed);
     PERSIST_MAGIC_WORD.store(PERSIST_MAGIC, PersistOrdering::Relaxed);
 }
@@ -201,9 +190,9 @@ fn persist_update(f: impl FnOnce(&mut Persist)) {
 // Settings that survive a power cycle (flash, on top of the RTC RAM copy)
 // ---------------------------------------------------------------------------
 
-// RTC RAM is lost when the cell goes flat, so a stowed board would come
+// RTC RAM is lost when the cell goes flat, so a sleeping board would come
 // back with nothing configured and advertise at ~35 mA until it died
-// again. The same three words are therefore mirrored into flash, which
+// again. The same two words are therefore mirrored into flash, which
 // RTC RAM then caches: only a cold boot reads flash, so the wake-check
 // path stays free of it.
 //
@@ -213,10 +202,13 @@ fn persist_update(f: impl FnOnce(&mut Persist)) {
 // (rare), so rewriting the sector each time costs nothing in wear.
 
 const NVS_MAGIC: u32 = 0x6D69_6441; // "midA"
-const NVS_VERSION: u32 = 1;
-/// magic, version, sleep, stow, flags, crc32 - all u32, so the length is
+/// Version 2 dropped the stow interval. A version 1 record fails the check
+/// in `nvs_decode` and is ignored, which leaves the board awake rather than
+/// reading the old stow word as something else.
+const NVS_VERSION: u32 = 2;
+/// magic, version, sleep, flags, crc32 - all u32, so the length is
 /// already a multiple of the flash write word.
-const NVS_RECORD_LEN: usize = 24;
+const NVS_RECORD_LEN: usize = 20;
 
 /// Resolved `nvs` partition offset, 0 = lookup failed (no partition table
 /// or no such partition). Settings then degrade to RTC RAM only.
@@ -230,10 +222,9 @@ fn nvs_encode(p: &Persist) -> [u8; NVS_RECORD_LEN] {
     rec[0..4].copy_from_slice(&NVS_MAGIC.to_le_bytes());
     rec[4..8].copy_from_slice(&NVS_VERSION.to_le_bytes());
     rec[8..12].copy_from_slice(&p.sleep_interval_s.to_le_bytes());
-    rec[12..16].copy_from_slice(&p.stow_interval_s.to_le_bytes());
-    rec[16..20].copy_from_slice(&p.flags.to_le_bytes());
-    let crc = link::crc32(&rec[0..20]);
-    rec[20..24].copy_from_slice(&crc.to_le_bytes());
+    rec[12..16].copy_from_slice(&p.flags.to_le_bytes());
+    let crc = link::crc32(&rec[0..16]);
+    rec[16..20].copy_from_slice(&crc.to_le_bytes());
     rec
 }
 
@@ -242,13 +233,12 @@ fn nvs_decode(rec: &[u8; NVS_RECORD_LEN]) -> Option<Persist> {
     if word(0) != NVS_MAGIC || word(4) != NVS_VERSION {
         return None;
     }
-    if word(20) != link::crc32(&rec[0..20]) {
+    if word(16) != link::crc32(&rec[0..16]) {
         return None;
     }
     Some(Persist {
         sleep_interval_s: word(8),
-        stow_interval_s: word(12),
-        flags: word(16),
+        flags: word(12),
     })
 }
 
@@ -324,21 +314,13 @@ fn current_settings() -> ble::Settings {
         wio_sleep: p.flags & PFLAG_WIO_SLEEP != 0,
         gps_sleep: p.flags & PFLAG_GPS_SLEEP != 0,
         sleep_interval_s: p.sleep_interval_s,
-        stow_interval_s: p.stow_interval_s,
         notify_interval_ms: NOTIFY_INTERVAL_MS.lock(|c| c.get()),
     }
 }
 
 /// Interval for the next deep sleep, 0 = stay awake and keep advertising.
-/// Stow wins while armed so a stowed board keeps its long interval even
-/// though the routine wake-check setting is still stored underneath it.
 fn next_sleep_interval_s() -> u32 {
-    let p = persist_get();
-    if p.stow_interval_s > 0 {
-        p.stow_interval_s
-    } else {
-        p.sleep_interval_s
-    }
+    persist_get().sleep_interval_s
 }
 
 // ---------------------------------------------------------------------------
@@ -465,11 +447,6 @@ static OUT_CHANNEL: Channel<CriticalSectionRawMutex, OutFrame, 8> = Channel::new
 
 /// (is_ack, acked cmd, value-or-err) from the last ACK/NAK frame.
 static ACK_SIGNAL: Signal<CriticalSectionRawMutex, (bool, u8, u16)> = Signal::new();
-
-/// Raised by a `CFG_ESP_STOW_S` write carrying the stow interval. Ends the
-/// session so the board goes down without waiting for the central to
-/// disconnect - the app arms stow and walks away.
-static STOW_ARMED: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
 /// Serializes [`wio_request`] so a firmware transfer over USB and a config
 /// write over BLE cannot race for the single [`ACK_SIGNAL`].
@@ -856,8 +833,8 @@ async fn main(spawner: Spawner) -> ! {
         if let Some(saved) = nvs_load() {
             persist_update(|p| *p = saved);
             println!(
-                "nvs: restored sleep {} s, stow {} s, flags {:#x}",
-                saved.sleep_interval_s, saved.stow_interval_s, saved.flags
+                "nvs: restored sleep {} s, flags {:#x}",
+                saved.sleep_interval_s, saved.flags
             );
         }
     }
@@ -1062,14 +1039,6 @@ async fn serve_task<C: Controller>(
         };
         qprintln!("central connected");
 
-        // Somebody answered, so stow mode has done its job - disarm it or
-        // the board would drop back into a multi-hour sleep the moment
-        // this session ends.
-        if persist_get().stow_interval_s > 0 {
-            persist_update(|p| p.stow_interval_s = 0);
-            nvs_save();
-            qprintln!("stow disarmed by connect");
-        }
         // The rail is dark on every wake check; raise it now if that is
         // what the app configured. The WIO needs its boot time and the GPS
         // a cold TTFF from here, since both just came up from no power.
@@ -1082,12 +1051,6 @@ async fn serve_task<C: Controller>(
         qprintln!("central disconnected");
 
         let sleep_interval = next_sleep_interval_s();
-        if STOW_ARMED.signaled() {
-            // Deliberate stow: go down now. Lingering would only keep the
-            // radio up for a central that just asked us to disappear.
-            STOW_ARMED.reset();
-            enter_deep_sleep(rtc, sleep_interval);
-        }
         // Sleep mode: give the central a moment to reconnect, then sleep.
         if sleep_interval > 0 {
             Timer::after(Duration::from_secs(SLEEP_LINGER_S)).await;
@@ -1097,8 +1060,8 @@ async fn serve_task<C: Controller>(
 }
 
 /// Refresh the settings characteristic and notify the central. Covers
-/// changes the device makes on its own (a clamped interval, stow disarmed
-/// by a connect), not just ones the app asked for.
+/// changes the device makes on its own (a clamped interval), not just ones
+/// the app asked for.
 async fn publish_settings<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
     let value = current_settings().encode();
     if server.gps.settings.set(server, &value).is_err() {
@@ -1123,8 +1086,8 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
     // live events, not a stale backlog.
     while LOG_CHANNEL.try_receive().is_ok() {}
 
-    // The device may have changed things since the last session (stow
-    // disarmed by this very connect), so publish before serving.
+    // The device may have changed things since the last session (a clamped
+    // interval, settings restored from flash), so publish before serving.
     publish_settings(server, conn).await;
 
     let events = async {
@@ -1212,16 +1175,9 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
         }
     };
 
-    // A stow write acks from inside `events`, so give that ack a moment on
-    // the air before this arm tears the connection down.
-    let stow = async {
-        STOW_ARMED.wait().await;
-        Timer::after(Duration::from_millis(STOW_ACK_GRACE_MS)).await;
-    };
-
-    // Any arm ending (disconnect / position-notify failure / stow) ends the
+    // Any arm ending (disconnect / position-notify failure) ends the
     // session.
-    select(select3(events, notifier, logger), stow).await;
+    select3(events, notifier, logger).await;
 }
 
 /// Apply a config write and build the ack to send back.
@@ -1282,28 +1238,6 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                     persist_update(|p| p.sleep_interval_s = secs);
                     nvs_save();
                     qprintln!("config: esp sleep interval {} s", secs);
-                    return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
-                }
-                return packet::encode_ack(id, packet::ACK_BAD_VALUE, &[]);
-            }
-            ble::CFG_ESP_STOW_S => {
-                if let Ok(bytes) = <[u8; 4]>::try_from(value) {
-                    let mut secs = u32::from_le_bytes(bytes);
-                    if secs > 0 {
-                        secs = secs.clamp(ble::ESP_STOW_MIN_S, ble::ESP_STOW_MAX_S);
-                    }
-                    persist_update(|p| p.stow_interval_s = secs);
-                    // Written before the sleep, so a cell that goes flat
-                    // mid-stow still comes back stowed.
-                    nvs_save();
-                    if secs > 0 {
-                        // Ack first: arming ends this session, so the write
-                        // would otherwise go unanswered.
-                        qprintln!("config: stow for {} s, sleeping after ack", secs);
-                        STOW_ARMED.signal(secs);
-                    } else {
-                        qprintln!("config: stow disarmed");
-                    }
                     return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
                 }
                 return packet::encode_ack(id, packet::ACK_BAD_VALUE, &[]);

@@ -21,6 +21,12 @@ and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
 
 ## Build and flash
 
+**Using Pixi**
+From `tools/` directory run
+`pixi run esp-upload`
+`pixi run fw-upload`
+
+**Directly running**
 ```sh
 # protocol tests (host)
 cd proto && cargo test
@@ -119,11 +125,11 @@ mis-wired WIO shows on the console instead of just going silent. The
 ping (`cargo run --release --features verbose`).
 
 The settings characteristic (`c3a10009-...`, read + notify) carries the
-device's current power/sleep configuration as one 16-byte blob
+device's current power/sleep configuration as one 12-byte blob
 (`midair_proto::ble::Settings`), so an app can populate its controls on
 connect rather than assuming defaults. It is republished after every
 config write - including values the device changed itself, such as a
-clamped interval or stow being disarmed by the connect.
+clamped interval.
 
 Config command ids (config characteristic, `[id, len, value]`):
 
@@ -133,39 +139,38 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x10` | u8 0/1 | GPS + LoRa power rail (LDO) off/on |
 | `0x11` | u8 0/1 | WIO soft sleep (reset-pulse fallback on wake) |
 | `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / EXTINT wake) |
-| `0x13` | u32 s | ESP deep-sleep wake-check interval, 5 s..15 min, 0 = off |
-| `0x14` | u32 s | extended "stow" sleep, 15 min..24 h, 0 = disarm |
+| `0x13` | u32 s | ESP deep-sleep wake-check interval, 5 s..5 min, 0 = off |
 
 ### Low power
 
-Both sleep ids drive the same deep sleep and differ only in cadence and
-in how they are armed:
-
-- **`0x13` wake-check** - the responsive cadence, seconds to minutes.
-  While set, the C6 deep-sleeps whenever no central is connected and
-  wakes every interval to advertise for 15 s (double D2 blink). Persists
-  until changed.
-- **`0x14` stow** - one long interval for storage or transport. Writing
-  it acks, drops the connection and sleeps immediately. Each wake still
-  advertises the same 15 s; if nobody answers, the board stows again, so
-  it keeps the long interval indefinitely. A connect disarms stow and the
-  `0x13` cadence takes over again.
+`0x13` is the only sleep control. While set, the C6 deep-sleeps whenever
+no central is connected and wakes every interval to advertise for 15 s
+(double D2 blink). It persists until changed - a connect does not clear
+it, so an unattended board holds its cadence indefinitely and the setting
+means the same thing whether or not anyone is looking.
 
 The GPS/LoRa rail is **off** for the whole sleep and stays off through
-the wake-check advertising window - a wake that nobody answers never
-powers the WIO or GPS at all. The rail comes up only when a central
-actually connects (and only if `0x10` has it enabled), so the app should
-expect the WIO's boot time plus a GPS cold TTFF after connecting.
+the advertising window - a wake that nobody answers never powers the WIO
+or GPS at all. The rail comes up only when a central actually connects
+(and only if `0x10` has it enabled), so the app should expect the WIO's
+boot time plus a GPS cold TTFF after connecting.
 
-Both intervals, and the `0x10` rail setting, are held in RTC RAM and
-mirrored to the ESP's `nvs` flash partition, so they survive deep sleep
-*and* a flat battery - a board stowed for transport comes back stowed
-rather than advertising until the cell dies again. Flash is read only on
-a cold boot; wake checks run from the RTC RAM copy.
+The interval and the `0x10` rail setting are held in RTC RAM and mirrored
+to the ESP's `nvs` flash partition, so they survive deep sleep *and* a
+flat battery - a board put away for transport comes back on the same
+cadence rather than advertising until the cell dies again. Flash is read
+only on a cold boot; wake checks run from the RTC RAM copy.
 
-The wake is timed by the C6's uncalibrated RC slow clock, so a multi-hour
-stow can drift by tens of minutes - it paces a wake-check, not a
-schedule.
+The wake is timed by the C6's uncalibrated RC slow clock, so the interval
+drifts - it paces a wake-check, not a schedule.
+
+**Deep sleep has no wake source but the timer.** Nothing over the air can
+interrupt it: the radio is off, and there is no GPIO or button wake
+configured. The 5 min ceiling on `0x13` is what bounds that - it is the
+longest the board can ever be unreachable, short of a physical reset. A
+reset does get you back sooner, but a cold boot restores the interval
+from flash and the first advertising window is still the same 15 s, so it
+buys you a window you chose the timing of rather than an awake board.
 
 ## SD card
 
@@ -276,3 +281,17 @@ Inital WIO wipe:
 `MCP73831T-2ACI/OT`
 4.2 V
 Adjustable current. 500 mA @ 2k ohm programming resistor.
+
+
+## Inital power testing 
+
+Everything running (BLE connected, Satalite fix, SD logging)
+`75 mA`
+Everything running no SD (BLE connected, Satalite fix, pulse on LoRa TX)
+`66 mA`
+
+Fully running (BLE connected, Satalite fix, pulse on LoRa TX, SD logging)
+`120 mA`
+
+ESP only BLE connected
+`46 mA`

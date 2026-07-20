@@ -37,15 +37,18 @@ pub const REMOTE_LEN: usize = 1 + 2 + gps_proto::packet::POSITION_PACKET_LEN;
 /// Current device settings, readable so an app can populate its controls
 /// on connect instead of assuming defaults, and notified whenever a value
 /// changes (including changes the device makes itself, such as clamping a
-/// requested interval or disarming stow on connect).
+/// requested interval).
 pub const SETTINGS_UUID: &str = "c3a10009-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const SETTINGS_UUID_U128: u128 = 0xc3a10009_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
 /// Wire length of [`Settings`].
-pub const SETTINGS_LEN: usize = 16;
+pub const SETTINGS_LEN: usize = 12;
 /// Layout version in byte 0, so an app meeting a newer firmware can
 /// reject the blob rather than misread it.
-pub const SETTINGS_VERSION: u8 = 1;
+///
+/// Version 2 dropped the separate stow interval: one wake-check interval
+/// now covers every sleep the board does.
+pub const SETTINGS_VERSION: u8 = 2;
 
 pub const SFLAG_PWR_EN: u8 = 1 << 0;
 pub const SFLAG_WIO_SLEEP: u8 = 1 << 1;
@@ -62,8 +65,6 @@ pub struct Settings {
     pub gps_sleep: bool,
     /// Wake-check interval ([`CFG_ESP_SLEEP_S`]), 0 = sleep disabled.
     pub sleep_interval_s: u32,
-    /// Extended stow interval ([`CFG_ESP_STOW_S`]), 0 = disarmed.
-    pub stow_interval_s: u32,
     /// Position notify interval in ms (gps-proto config id 0x01).
     pub notify_interval_ms: u32,
 }
@@ -85,8 +86,7 @@ impl Settings {
         b[1] = flags;
         // b[2..4] reserved, kept zero to word-align the u32s.
         b[4..8].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
-        b[8..12].copy_from_slice(&self.stow_interval_s.to_le_bytes());
-        b[12..16].copy_from_slice(&self.notify_interval_ms.to_le_bytes());
+        b[8..12].copy_from_slice(&self.notify_interval_ms.to_le_bytes());
         b
     }
 
@@ -102,8 +102,7 @@ impl Settings {
             wio_sleep: b[1] & SFLAG_WIO_SLEEP != 0,
             gps_sleep: b[1] & SFLAG_GPS_SLEEP != 0,
             sleep_interval_s: word(4),
-            stow_interval_s: word(8),
-            notify_interval_ms: word(12),
+            notify_interval_ms: word(8),
         })
     }
 }
@@ -120,33 +119,23 @@ pub const CFG_GPS_SLEEP: u8 = 0x12;
 /// the ESP deep-sleeps whenever no central is connected, waking every
 /// interval to advertise for a short window. 0 disables sleep mode.
 ///
-/// This is the responsive cadence - seconds to minutes - so the app can
-/// get the board back without a long wait. For storage or transport use
-/// [`CFG_ESP_STOW_S`] instead.
+/// The board keeps this across a connect: reaching it does not clear the
+/// interval, so an unattended tracker holds its cadence indefinitely and
+/// the setting means the same thing whether or not anyone is looking. The
+/// GPS/LoRa rail stays off through every sleep.
+///
+/// Note the wake is timed by the C6's uncalibrated RC slow clock, so the
+/// interval drifts. It paces a wake-check, not a schedule.
 pub const CFG_ESP_SLEEP_S: u8 = 0x13;
 
 /// Clamp range for [`CFG_ESP_SLEEP_S`].
+///
+/// The ceiling is the worst case for reaching a sleeping board, since
+/// deep sleep has no wake source but the timer - nothing over the air can
+/// interrupt it. Five minutes keeps that wait short enough that a sleeping
+/// board is always a wait rather than a lockout.
 pub const ESP_SLEEP_MIN_S: u32 = 5;
-pub const ESP_SLEEP_MAX_S: u32 = 15 * 60;
-
-/// `u32` seconds: arm the extended low-power ("stow") sleep and enter it
-/// immediately. Takes precedence over [`CFG_ESP_SLEEP_S`] until a central
-/// connects, which disarms it and restores the routine interval.
-///
-/// Each stow wake advertises for the same short window; if nobody answers
-/// the board stows again, so an unattended tracker keeps to the long
-/// interval indefinitely. The GPS/LoRa rail stays off throughout.
-///
-/// Note the wake is timed by the C6's uncalibrated RC slow clock, so a
-/// multi-hour interval can drift by tens of minutes. It paces a
-/// wake-check, not a schedule.
-pub const CFG_ESP_STOW_S: u8 = 0x14;
-
-/// Clamp range for [`CFG_ESP_STOW_S`]. The lower bound meets
-/// [`ESP_SLEEP_MAX_S`] so every interval is reachable through one id or
-/// the other.
-pub const ESP_STOW_MIN_S: u32 = 15 * 60;
-pub const ESP_STOW_MAX_S: u32 = 24 * 3600;
+pub const ESP_SLEEP_MAX_S: u32 = 5 * 60;
 
 // -- Bulk transfer protocol (writes on [`BULK_UUID`]) -------------------------
 //
@@ -213,7 +202,6 @@ mod tests {
             wio_sleep: false,
             gps_sleep: true,
             sleep_interval_s: 300,
-            stow_interval_s: 43200,
             notify_interval_ms: 1000,
         };
         let bytes = s.encode();
