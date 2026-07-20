@@ -31,9 +31,9 @@ pub trait PacketRadio {
 use stm32wlxx_hal::spi::{SgMiso, SgMosi};
 use stm32wlxx_hal::subghz::{
     CalibrateImage, CfgIrq, CodingRate, FallbackMode, HeaderType, Irq, LoRaBandwidth,
-    LoRaModParams, LoRaPacketParams, LoRaSyncWord, Ocp, PaConfig, PaSel, PacketType, RampTime,
-    RegMode, RfFreq, SleepCfg, SpreadingFactor, StandbyClk, SubGhz, TcxoMode, TcxoTrim, Timeout,
-    TxParams,
+    LoRaModParams, LoRaPacketParams, LoRaSyncWord, Ocp, PMode, PaConfig, PaSel, PacketType,
+    RampTime, RegMode, RfFreq, SleepCfg, SpreadingFactor, StandbyClk, SubGhz, TcxoMode, TcxoTrim,
+    Timeout, TxParams,
 };
 
 /// Errors from the SubGHz radio.
@@ -128,6 +128,19 @@ impl Sx1262Driver {
                     .set_ramp_time(RampTime::Micros200),
             )
             .expect("set_tx_params");
+
+        // Receive-side counterpart to the TX power above. The RxGain
+        // register is not covered by warm-start retention, so it has to be
+        // rewritten on every entry to this function rather than set once -
+        // which is what happens anyway, since `init` is what brings the
+        // radio back from both soft sleep and a config push.
+        self.radio
+            .set_rx_gain(if cfg.rx_boost {
+                PMode::Boost
+            } else {
+                PMode::PowerSaving
+            })
+            .expect("set_rx_gain");
 
         let sf = match cfg.spreading_factor {
             5 => SpreadingFactor::Sf5,

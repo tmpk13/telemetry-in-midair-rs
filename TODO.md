@@ -7,3 +7,7 @@ Esp needs to sleep
 Decrease packet size on wio to maximize range?
 
 Need antenna.
+
+Swap to WIO-S3?
+
+Remove mech probably

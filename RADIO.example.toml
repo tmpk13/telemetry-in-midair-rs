@@ -39,6 +39,9 @@ coding_rate_description = "Coding rate denominator 5-8 for 4/5..4/8. Higher adds
 power_dbm = 22
 power_dbm_description = "Transmit power in dBm, -9 to 22 on the high-power PA."
 
+rx_boost = false
+rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for a few mA more current whenever the node is listening. Unlike the other keys this one only helps the receiving end, so it is worth setting on a node that mainly listens."
+
 # Low-data-rate optimization is derived automatically from spreading
 # factor and bandwidth; there is no key for it.
 

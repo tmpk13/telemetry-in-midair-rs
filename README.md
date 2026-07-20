@@ -63,6 +63,7 @@ spreading_factor = 7       # 5-12 (7)
 bandwidth_khz = 125        # 62|125|250|500 (125)
 coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
+rx_boost = false           # boosted RX gain (false)
 
 [mesh]
 address = 1                # 1-255 (1)
@@ -87,6 +88,14 @@ dynamic_model = "portable" # portable|stationary|pedestrian|automotive|
 
 Raise `listen_ms` together with slow presets (SF12 etc.) - the listen
 window must exceed one packet's air time.
+
+`rx_boost` is the one link-budget key that is not symmetric: it buys
+roughly +2 dB of sensitivity on the node it is set on, and does nothing
+for what that node transmits. Range is set by the worse of the two
+directions, so it only helps where the receiving end is the weak one -
+setting it on both nodes is the usual answer, at a few mA each while
+listening. Every other radio key has to match across nodes to link at
+all; this one does not.
 
 The `[gps]` settings are pushed to the module as a single UBX-CFG-VALSET at
 boot and again whenever a new config is applied (constellation, power and

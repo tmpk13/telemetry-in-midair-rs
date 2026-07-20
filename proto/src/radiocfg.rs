@@ -16,6 +16,7 @@
 //! bandwidth_khz = 125       # 62, 125, 250, 500
 //! coding_rate = 5           # 4/5 .. 4/8
 //! power_dbm = 22            # -9 .. 22
+//! rx_boost = false          # boosted RX gain, ~+2 dB for more RX current
 //!
 //! [mesh]
 //! address = 1               # 1-255
@@ -134,6 +135,14 @@ pub struct RadioConfig {
     pub coding_rate: u8,
     /// TX power in dBm (-9..22 on the STM32WLE5 high-power PA).
     pub power_dbm: i8,
+    /// Receiver boosted gain (SX126x `RxGain` register). Roughly +2 dB of
+    /// sensitivity for a few mA more while listening; the chip powers up
+    /// with it off.
+    ///
+    /// Only two of the register's four settings are documented (power
+    /// saving and boosted), so this is a bool rather than an enum - the
+    /// intermediate values have no specified behavior to expose.
+    pub rx_boost: bool,
     /// Mesh node address (1-255).
     pub address: u8,
     /// Mesh listen period before transmitting (ms).
@@ -154,6 +163,10 @@ impl Default for RadioConfig {
             bandwidth_khz: 125,
             coding_rate: 5,
             power_dbm: 22,
+            // Off, matching the chip's power-up state: enabling it costs
+            // receive current continuously on whichever node is listening,
+            // which is a trade to opt into rather than inherit.
+            rx_boost: false,
             address: 1,
             listen_ms: 200,
             // 2 hops so any node also acts as a repeater by default.
@@ -273,6 +286,7 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 }
                 cfg.power_dbm = v as i8;
             }
+            "rx_boost" => cfg.rx_boost = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
             "address" => {
                 let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
                 if !(1..=255).contains(&v) {
@@ -411,6 +425,7 @@ mod tests {
             bandwidth_khz = 125
             coding_rate = 8
             power_dbm = 14
+            rx_boost = true
 
             [mesh]
             address = 3
@@ -425,6 +440,7 @@ mod tests {
         assert_eq!(cfg.spreading_factor, 10);
         assert_eq!(cfg.coding_rate, 8);
         assert_eq!(cfg.power_dbm, 14);
+        assert!(cfg.rx_boost);
         assert_eq!(cfg.address, 3);
         assert_eq!(cfg.listen_ms, 900);
         assert_eq!(cfg.lifetime, 3);
@@ -502,6 +518,7 @@ mod tests {
         assert_eq!(parse("bandwidth_khz = 100"), Err(ConfigError::OutOfRange(1)));
         assert_eq!(parse("power_dbm = 23"), Err(ConfigError::OutOfRange(1)));
         assert_eq!(parse("address = 0"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("rx_boost = 1"), Err(ConfigError::BadValue(1)));
         assert_eq!(parse("\nnot a kv line"), Err(ConfigError::Syntax(2)));
         assert_eq!(parse_bytes(&[0xFF, 0xFE]), Err(ConfigError::Utf8));
         // Unknown keys pass through untouched.
