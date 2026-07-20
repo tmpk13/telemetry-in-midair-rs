@@ -16,6 +16,15 @@ pyserial = ">=3.5"
 # --no-build uploads the existing image; --file / --port override.
 wio-upload = "python wio_fw_upload.py"
 
+# Push a radio config to the WIO through the same USB path, applied live and
+# saved to its SD card:
+#   pixi run wio-config --address 3
+#   pixi run wio-config --address 3 --set role=tx_only
+# Sends a whole file (default ../RADIO.example.toml, i.e. firmware defaults
+# plus the edits given), since the board cannot be read back - use --file to
+# start from settings of your own, and --dry-run to see the result first.
+wio-config = "python wio_config.py"
+
 # Build and flash the ESP32-C6 over its USB Serial/JTAG port, then stay
 # attached to the console (verbose: per-frame link and heartbeat logs).
 esp-upload = { cmd = "cargo run --release --features verbose", cwd = "../esp" }
