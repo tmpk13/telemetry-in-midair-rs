@@ -88,10 +88,11 @@ const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 1;
 
 /// How long to advertise on a sleep-mode wake check before going back to
-/// deep sleep.
+/// deep sleep. A budget for the whole wake, not per connection attempt:
+/// see the deadline in `serve_task`.
 const WAKE_ADV_WINDOW_S: u64 = 15;
-/// Linger after a disconnect (sleep mode active) so the phone can come
-/// straight back before the C6 vanishes.
+/// How long to keep advertising after a disconnect (sleep mode active) so
+/// the phone can come straight back before the C6 vanishes.
 const SLEEP_LINGER_S: u64 = 5;
 
 // ---------------------------------------------------------------------------
@@ -994,10 +995,23 @@ async fn serve_task<C: Controller>(
     )
     .expect("scan data fits");
 
-    // First window after boot: with sleep mode on, stay reachable for the
-    // advertising window and then sleep.
+    // The advertising budget for this wake, held as a deadline rather than a
+    // per-attempt timeout.
+    //
+    // Every path below that restarts advertising - a failed `advertise`, a
+    // connection attempt that errors out, a server that will not attach -
+    // loops back to the top, and none of them may extend the window. Timing
+    // each attempt separately let a central that kept failing to connect reset
+    // the budget forever, so the board woke, drew its full advertising current
+    // and never slept again. A deadline cannot be restarted by a retry.
+    let mut wake_ends = Instant::now() + Duration::from_secs(WAKE_ADV_WINDOW_S);
+
     loop {
         let sleep_interval = next_sleep_interval_s();
+        // Budget spent, whatever used it up.
+        if sleep_interval > 0 && Instant::now() >= wake_ends {
+            enter_deep_sleep(rtc, sleep_interval);
+        }
         qprintln!("advertising as {}", ble::DEVICE_NAME);
         let advertiser = match peripheral
             .advertise(
@@ -1011,16 +1025,24 @@ async fn serve_task<C: Controller>(
         {
             Ok(a) => a,
             Err(_) => {
+                qprintln!("advertise failed, retrying");
                 Timer::after(Duration::from_secs(1)).await;
                 continue;
             }
         };
 
         let conn = if sleep_interval > 0 {
-            match with_timeout(Duration::from_secs(WAKE_ADV_WINDOW_S), advertiser.accept()).await
-            {
+            let left = wake_ends.saturating_duration_since(Instant::now());
+            match with_timeout(left, advertiser.accept()).await {
                 Ok(Ok(c)) => c,
-                Ok(Err(_)) => continue,
+                Ok(Err(_)) => {
+                    // A central started a connection and it did not complete.
+                    // The pause keeps a repeated failure off a hot spin, and
+                    // it comes out of the wake budget like everything else.
+                    qprintln!("connect attempt failed");
+                    Timer::after(Duration::from_millis(200)).await;
+                    continue;
+                }
                 Err(_) => {
                     // Window expired with nobody interested.
                     enter_deep_sleep(rtc, sleep_interval);
@@ -1029,7 +1051,11 @@ async fn serve_task<C: Controller>(
         } else {
             match advertiser.accept().await {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(_) => {
+                    qprintln!("connect attempt failed");
+                    Timer::after(Duration::from_millis(200)).await;
+                    continue;
+                }
             }
         };
 
@@ -1050,12 +1076,12 @@ async fn serve_task<C: Controller>(
         gatt_session(&conn, server).await;
         qprintln!("central disconnected");
 
-        let sleep_interval = next_sleep_interval_s();
-        // Sleep mode: give the central a moment to reconnect, then sleep.
-        if sleep_interval > 0 {
-            Timer::after(Duration::from_secs(SLEEP_LINGER_S)).await;
-            enter_deep_sleep(rtc, sleep_interval);
-        }
+        // Linger by advertising, not by idling. The point is to let the phone
+        // come straight back, which it cannot do if the board is awake but not
+        // discoverable - which is all the old `Timer::after` before sleeping
+        // achieved. Looping back re-advertises, and the deadline check at the
+        // top sends the board down when the linger runs out.
+        wake_ends = Instant::now() + Duration::from_secs(SLEEP_LINGER_S);
     }
 }
 
