@@ -45,6 +45,41 @@ pub enum Role {
     Repeater,
 }
 
+/// Supply voltage the radio drives the TCXO at (`SetTcxoMode` trim field).
+///
+/// This is a property of the crystal fitted to the board, not a preference.
+/// The Wio-E5 module's TCXO is a 1.8 V part; the other values exist for
+/// boards built around a different one, and setting a value the hardware
+/// does not expect stops the oscillator starting, which takes the radio
+/// with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcxoVolts {
+    V1_6,
+    V1_7,
+    V1_8,
+    V2_2,
+    V2_4,
+    V2_7,
+    V3_0,
+    V3_3,
+}
+
+impl TcxoVolts {
+    /// `SetTcxoMode` trim enum value.
+    pub fn trim(self) -> u8 {
+        match self {
+            TcxoVolts::V1_6 => 0x0,
+            TcxoVolts::V1_7 => 0x1,
+            TcxoVolts::V1_8 => 0x2,
+            TcxoVolts::V2_2 => 0x3,
+            TcxoVolts::V2_4 => 0x4,
+            TcxoVolts::V2_7 => 0x5,
+            TcxoVolts::V3_0 => 0x6,
+            TcxoVolts::V3_3 => 0x7,
+        }
+    }
+}
+
 /// GPS receiver power mode (u-blox M10 `CFG-PM-OPERATEMODE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerMode {
@@ -186,6 +221,22 @@ pub struct RadioConfig {
     /// Whether the SD card is used at all. False stops logging, config
     /// read-back and the card's power draw.
     pub sd_enabled: bool,
+    /// Use the internal DC-DC (SMPS) rather than the LDO, roughly halving
+    /// RX and TX current at 3.3 V.
+    ///
+    /// The SMPS needs the module's inductor fitted, so this is only safe to
+    /// leave on for boards that have one - the Wio-E5 does. Turning it off
+    /// costs current but is safe anywhere.
+    pub dcdc_enabled: bool,
+    /// Supply the radio drives the TCXO at.
+    pub tcxo_volts: TcxoVolts,
+    /// How long the radio waits for the TCXO to stabilize before it will
+    /// use the clock, in milliseconds.
+    ///
+    /// Paid on every wake from sleep, so it is a real duty-cycle cost - but
+    /// too short and the radio runs off an oscillator that has not settled,
+    /// which shows up as a receiver that works warm and fails cold.
+    pub tcxo_startup_ms: u16,
     /// GPS receiver configuration.
     pub gps: GpsConfig,
 }
@@ -215,6 +266,11 @@ impl Default for RadioConfig {
             // air time that has to be paid on every single broadcast.
             beacon_fields: crate::lora::FIELDS_DEFAULT,
             sd_enabled: true,
+            // The Wio-E5 carries the SMPS inductor and a 1.8 V TCXO; these
+            // defaults are that module's hardware, not a tuning choice.
+            dcdc_enabled: true,
+            tcxo_volts: TcxoVolts::V1_8,
+            tcxo_startup_ms: 10,
             gps: GpsConfig::default(),
         }
     }
@@ -391,6 +447,31 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 if cfg.beacon_fields & lora::FIELDS_REQUIRED != lora::FIELDS_REQUIRED {
                     return Err(ConfigError::OutOfRange(lineno));
                 }
+            }
+            "dcdc_enabled" => {
+                cfg.dcdc_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?
+            }
+            "tcxo_volts" => {
+                cfg.tcxo_volts = match unquote(value) {
+                    "1.6" => TcxoVolts::V1_6,
+                    "1.7" => TcxoVolts::V1_7,
+                    "1.8" => TcxoVolts::V1_8,
+                    "2.2" => TcxoVolts::V2_2,
+                    "2.4" => TcxoVolts::V2_4,
+                    "2.7" => TcxoVolts::V2_7,
+                    "3.0" => TcxoVolts::V3_0,
+                    "3.3" => TcxoVolts::V3_3,
+                    _ => return Err(ConfigError::BadValue(lineno)),
+                };
+            }
+            "tcxo_startup_ms" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                // The ceiling is a stuck-oscillator guard: past this the
+                // radio is not slow to start, it is not starting.
+                if !(1..=1_000).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.tcxo_startup_ms = v as u16;
             }
             // -- [sd] -------------------------------------------------------
             "sd_enabled" => cfg.sd_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
@@ -644,6 +725,29 @@ mod tests {
         assert_eq!(parse("fields = \"altitude\""), Err(ConfigError::OutOfRange(1)));
         assert_eq!(parse("fields = \"lat\""), Err(ConfigError::OutOfRange(1)));
         assert_eq!(parse("fields = \"\""), Err(ConfigError::BadValue(1)));
+    }
+
+    #[test]
+    fn tcxo_and_regulator_defaults_match_the_wio_e5() {
+        let cfg = RadioConfig::default();
+        assert!(cfg.dcdc_enabled);
+        assert_eq!(cfg.tcxo_volts, TcxoVolts::V1_8);
+        assert_eq!(cfg.tcxo_volts.trim(), 0x2);
+        assert_eq!(cfg.tcxo_startup_ms, 10);
+    }
+
+    #[test]
+    fn tcxo_and_regulator_parse() {
+        assert!(!parse("dcdc_enabled = false").unwrap().dcdc_enabled);
+        assert_eq!(parse("tcxo_volts = \"3.3\"").unwrap().tcxo_volts, TcxoVolts::V3_3);
+        assert_eq!(parse("tcxo_volts = \"1.6\"").unwrap().tcxo_volts.trim(), 0x0);
+        assert_eq!(parse("tcxo_startup_ms = 50").unwrap().tcxo_startup_ms, 50);
+        // A voltage the chip has no trim setting for is a typo, not a
+        // value to round to the nearest one.
+        assert_eq!(parse("tcxo_volts = \"3.0V\""), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("tcxo_volts = \"5.0\""), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("tcxo_startup_ms = 0"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("tcxo_startup_ms = 2000"), Err(ConfigError::OutOfRange(1)));
     }
 
     #[test]

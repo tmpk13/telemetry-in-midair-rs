@@ -81,15 +81,35 @@ impl Sx1262Driver {
 
         self.radio.set_standby(StandbyClk::Rc).expect("set_standby");
 
-        // Use the SMPS regulator for better efficiency.
-        self.radio.set_regulator_mode(RegMode::Smps).ok();
+        // DC-DC roughly halves RX/TX current, but only works on a board
+        // with the SMPS inductor fitted, so it stays configurable.
+        self.radio
+            .set_regulator_mode(if cfg.dcdc_enabled {
+                RegMode::Smps
+            } else {
+                RegMode::Ldo
+            })
+            .ok();
 
-        // Wio-E5 has a 32 MHz TCXO on DIO3.
+        // The radio powers the 32 MHz TCXO itself and waits for it to
+        // settle before using the clock - the same job the SX1262 does with
+        // SetDio3AsTcxoCtrl, which this chip exposes as SetTcxoMode because
+        // the radio is on-die and there is no external DIO3 to name.
+        let trim = match cfg.tcxo_volts.trim() {
+            0x0 => TcxoTrim::Volts1pt6,
+            0x1 => TcxoTrim::Volts1pt7,
+            0x2 => TcxoTrim::Volts1pt8,
+            0x3 => TcxoTrim::Volts2pt2,
+            0x4 => TcxoTrim::Volts2pt4,
+            0x5 => TcxoTrim::Volts2pt7,
+            0x6 => TcxoTrim::Volts3pt0,
+            _ => TcxoTrim::Volts3pt3,
+        };
         self.radio
             .set_tcxo_mode(
                 &TcxoMode::new()
-                    .set_txco_trim(TcxoTrim::Volts1pt8)
-                    .set_timeout(Timeout::from_millis_sat(10)),
+                    .set_txco_trim(trim)
+                    .set_timeout(Timeout::from_millis_sat(cfg.tcxo_startup_ms as u32)),
             )
             .expect("set_tcxo_mode");
 

@@ -23,13 +23,7 @@ WIO-E5 (Maybe usb bridge too (CH32?)) listener. (Dongle?)
 Need antenna for BLE.
 Remove W.FL antenna add wire antenna (31 mm).
 
-
-What is happening to altitude? Time?
-
-
 Go mode. Should sleep cycle the ESP, and send the gps coordinates over the radio.
 
-The GPS coords should go over the radio (Maybe time if needed probably not). The rest of the data should be sd logged.
-If not connected at start will the SD card ever start logging?
 
 SD logging to file?

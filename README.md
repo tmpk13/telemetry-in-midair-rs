@@ -64,6 +64,9 @@ bandwidth_khz = 125        # 62|125|250|500 (125)
 coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
 rx_boost = false           # boosted RX gain (false)
+dcdc_enabled = true        # internal DC-DC instead of LDO (true)
+tcxo_volts = "1.8"         # TCXO supply; board hardware, not a tuning knob
+tcxo_startup_ms = 10       # TCXO settling wait, 1-1000 (10)
 
 [network]
 address = 1                # 1-255 (1)
