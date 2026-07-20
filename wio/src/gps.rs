@@ -4,7 +4,9 @@
 //!
 //! NMEA parsing is shared with the ESP32-C3 beacon via gps-proto: RMC owns
 //! the fix flag, position, motion and time; GGA contributes altitude and
-//! satellite count. The folded state is a wire-ready [`PositionPacket`].
+//! satellite count. The folded state is a wire-ready [`PositionPacket`],
+//! whose fix-derived fields are zeroed when the fix drops rather than left
+//! holding their last values.
 
 use cortex_m::interrupt::CriticalSection;
 use gps_proto::nmea::{self, Sentence};
@@ -206,6 +208,7 @@ impl Gps {
                     }
                 } else {
                     p.flags &= !FLAG_FIX;
+                    clear_fix_fields(p);
                 }
                 if let Some(v) = rmc.speed_cms {
                     p.speed_cms = v;
@@ -311,6 +314,7 @@ impl Gps {
         self.extint.set_level_low();
         self.sleeping = true;
         self.packet.flags &= !FLAG_FIX;
+        clear_fix_fields(&mut self.packet);
     }
 
     /// Wake the module from backup: EXTINT pulse plus UART traffic.
@@ -322,4 +326,25 @@ impl Gps {
         self.write_all(&[0xFF, 0xFF]);
         self.sleeping = false;
     }
+}
+
+/// Zero the fields that only mean anything while a fix holds.
+///
+/// Each is written from an optional NMEA field, and the module leaves those
+/// fields empty once the fix drops - GGA stops carrying altitude, RMC stops
+/// carrying speed and course. Without this the last good values would sit in
+/// the packet indefinitely, so anything that reads it without checking
+/// [`FLAG_FIX`] sees an altitude from minutes or hours ago as if it were
+/// current.
+///
+/// `tod_ms` is deliberately not cleared: the receiver keeps decoding time
+/// from the satellites it still tracks, so time stays valid across a fix
+/// loss and RMC keeps carrying it.
+fn clear_fix_fields(p: &mut PositionPacket) {
+    p.lat_e7 = 0;
+    p.lon_e7 = 0;
+    p.alt_dm = 0;
+    p.speed_cms = 0;
+    p.course_cdeg = 0;
+    p.sats = 0;
 }
