@@ -22,7 +22,7 @@
 //! Payloads are sent at their true length - nothing is padded - so shrinking
 //! a payload format shortens the air time it costs.
 
-use gps_proto::packet::{PositionPacket, POSITION_PACKET_LEN};
+use gps_proto::packet::{PositionPacket, FLAG_FIX};
 
 /// Frame header length: `[src, id, hops_left]`.
 pub const HEADER_LEN: usize = 3;
@@ -88,26 +88,153 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// Position broadcast: `[POSITION tag] [PositionPacket 20B]`.
-pub const MSG_POSITION: u8 = 0x50;
+/// Position broadcast: `[POSITION tag] [field mask] [selected fields]`.
+///
+/// The sender picks which fields to spend air time on (see
+/// `RadioConfig::beacon_fields`) and stamps its choice into the mask, so the
+/// frame describes its own layout and two nodes configured differently still
+/// understand each other.
+///
+/// Tag 0x50 was the earlier fixed 20-byte layout and is deliberately not
+/// reused: firmware of either vintage rejects the other's tag outright
+/// rather than reading a mask out of a latitude.
+pub const MSG_POSITION: u8 = 0x51;
 
-/// Encoded position message length.
-pub const POSITION_MSG_LEN: usize = 1 + POSITION_PACKET_LEN;
+/// Field mask bits, in the order the fields appear in the payload.
+pub const FIELD_LAT: u8 = 1 << 0;
+pub const FIELD_LON: u8 = 1 << 1;
+pub const FIELD_ALT: u8 = 1 << 2;
+pub const FIELD_SPEED: u8 = 1 << 3;
+pub const FIELD_COURSE: u8 = 1 << 4;
+pub const FIELD_SATS: u8 = 1 << 5;
+pub const FIELD_TIME: u8 = 1 << 6;
 
-/// Encode a position broadcast.
-pub fn encode_position(p: &PositionPacket) -> [u8; POSITION_MSG_LEN] {
-    let mut b = [0u8; POSITION_MSG_LEN];
-    b[0] = MSG_POSITION;
-    b[1..].copy_from_slice(&p.encode());
-    b
+/// Every field this format can carry.
+pub const FIELDS_ALL: u8 =
+    FIELD_LAT | FIELD_LON | FIELD_ALT | FIELD_SPEED | FIELD_COURSE | FIELD_SATS | FIELD_TIME;
+
+/// Position and nothing else - the default beacon payload.
+pub const FIELDS_DEFAULT: u8 = FIELD_LAT | FIELD_LON;
+
+/// Fields without which a position broadcast is not one.
+pub const FIELDS_REQUIRED: u8 = FIELD_LAT | FIELD_LON;
+
+/// Longest encoded position message: tag + mask + every field.
+pub const POSITION_MSG_MAX: usize = 2 + 4 + 4 + 2 + 2 + 2 + 1 + 4;
+
+/// Wire width of each field present in `mask`.
+const fn fields_len(mask: u8) -> usize {
+    let mut n = 0;
+    if mask & FIELD_LAT != 0 {
+        n += 4;
+    }
+    if mask & FIELD_LON != 0 {
+        n += 4;
+    }
+    if mask & FIELD_ALT != 0 {
+        n += 2;
+    }
+    if mask & FIELD_SPEED != 0 {
+        n += 2;
+    }
+    if mask & FIELD_COURSE != 0 {
+        n += 2;
+    }
+    if mask & FIELD_SATS != 0 {
+        n += 1;
+    }
+    if mask & FIELD_TIME != 0 {
+        n += 4;
+    }
+    n
 }
 
-/// Decode a position broadcast, or `None` if the payload is something else.
+/// Encoded length of a position message carrying `mask`.
+pub const fn position_msg_len(mask: u8) -> usize {
+    2 + fields_len(mask)
+}
+
+/// Encode a position broadcast carrying the fields in `mask`, returning the
+/// buffer and the used length. Bits outside [`FIELDS_ALL`] are ignored.
+pub fn encode_position(p: &PositionPacket, mask: u8) -> ([u8; POSITION_MSG_MAX], usize) {
+    let mask = mask & FIELDS_ALL;
+    let mut b = [0u8; POSITION_MSG_MAX];
+    b[0] = MSG_POSITION;
+    b[1] = mask;
+    let mut n = 2;
+    let mut put = |bytes: &[u8]| {
+        b[n..n + bytes.len()].copy_from_slice(bytes);
+        n += bytes.len();
+    };
+    if mask & FIELD_LAT != 0 {
+        put(&p.lat_e7.to_le_bytes());
+    }
+    if mask & FIELD_LON != 0 {
+        put(&p.lon_e7.to_le_bytes());
+    }
+    if mask & FIELD_ALT != 0 {
+        put(&p.alt_dm.to_le_bytes());
+    }
+    if mask & FIELD_SPEED != 0 {
+        put(&p.speed_cms.to_le_bytes());
+    }
+    if mask & FIELD_COURSE != 0 {
+        put(&p.course_cdeg.to_le_bytes());
+    }
+    if mask & FIELD_SATS != 0 {
+        put(&[p.sats]);
+    }
+    if mask & FIELD_TIME != 0 {
+        put(&p.tod_ms.to_le_bytes());
+    }
+    (b, n)
+}
+
+/// Decode a position broadcast, or `None` if the payload is something else
+/// or is shorter than its own mask claims.
+///
+/// Fields the sender left out come back zeroed. [`FLAG_FIX`] is always set:
+/// a node only beacons while it has a fix, so receiving one is the proof,
+/// and the flag costs nothing to reconstruct here.
 pub fn decode_position(data: &[u8]) -> Option<PositionPacket> {
-    if data.first() != Some(&MSG_POSITION) || data.len() < POSITION_MSG_LEN {
+    if data.first() != Some(&MSG_POSITION) || data.len() < 2 {
         return None;
     }
-    PositionPacket::decode(&data[1..POSITION_MSG_LEN])
+    let mask = data[1] & FIELDS_ALL;
+    let body = data.get(2..2 + fields_len(mask))?;
+
+    let mut n = 0;
+    let mut take = |len: usize| {
+        let s = &body[n..n + len];
+        n += len;
+        s
+    };
+    let mut p = PositionPacket {
+        flags: FLAG_FIX,
+        ..PositionPacket::default()
+    };
+    if mask & FIELD_LAT != 0 {
+        p.lat_e7 = i32::from_le_bytes(take(4).try_into().ok()?);
+    }
+    if mask & FIELD_LON != 0 {
+        p.lon_e7 = i32::from_le_bytes(take(4).try_into().ok()?);
+    }
+    if mask & FIELD_ALT != 0 {
+        p.alt_dm = i16::from_le_bytes(take(2).try_into().ok()?);
+    }
+    if mask & FIELD_SPEED != 0 {
+        p.speed_cms = u16::from_le_bytes(take(2).try_into().ok()?);
+    }
+    if mask & FIELD_COURSE != 0 {
+        p.course_cdeg = u16::from_le_bytes(take(2).try_into().ok()?);
+    }
+    if mask & FIELD_SATS != 0 {
+        p.sats = take(1)[0];
+    }
+    if mask & FIELD_TIME != 0 {
+        p.tod_ms = u32::from_le_bytes(take(4).try_into().ok()?);
+    }
+    Some(p)
 }
 
 #[cfg(test)]
@@ -129,25 +256,79 @@ mod tests {
     }
 
     #[test]
-    fn position_roundtrip() {
+    fn position_roundtrip_all_fields() {
         let p = sample();
-        let enc = encode_position(&p);
-        assert_eq!(enc.len(), 21);
-        assert_eq!(decode_position(&enc), Some(p));
+        let (enc, n) = encode_position(&p, FIELDS_ALL);
+        assert_eq!(n, POSITION_MSG_MAX);
+        assert_eq!(decode_position(&enc[..n]), Some(p));
         assert_eq!(decode_position(b"hello"), None);
-        // A tagged but truncated payload is rejected rather than decoded
-        // from whatever follows it in the buffer.
-        assert_eq!(decode_position(&enc[..10]), None);
+        // A tagged payload shorter than its own mask claims is rejected
+        // rather than decoded from whatever follows it in the buffer.
+        assert_eq!(decode_position(&enc[..n - 1]), None);
+        assert_eq!(decode_position(&enc[..1]), None);
+    }
+
+    /// The default beacon is position only, and that is what the air time
+    /// saving rests on: 10 payload bytes against the 21 of a full packet.
+    #[test]
+    fn default_fields_carry_position_only() {
+        let (enc, n) = encode_position(&sample(), FIELDS_DEFAULT);
+        assert_eq!(n, 10);
+        assert_eq!(position_msg_len(FIELDS_DEFAULT), 10);
+        let got = decode_position(&enc[..n]).unwrap();
+        assert_eq!((got.lat_e7, got.lon_e7), (481_173_000, -1_226_760_000));
+        // Everything not selected comes back zeroed, not stale or garbage.
+        assert_eq!(got.alt_dm, 0);
+        assert_eq!(got.sats, 0);
+        assert_eq!(got.tod_ms, 0);
+        // Receiving a beacon at all is proof the sender had a fix.
+        assert!(got.has_fix());
+    }
+
+    #[test]
+    fn each_field_costs_its_own_width() {
+        let base = position_msg_len(FIELDS_DEFAULT);
+        for (bit, width) in [
+            (FIELD_ALT, 2),
+            (FIELD_SPEED, 2),
+            (FIELD_COURSE, 2),
+            (FIELD_SATS, 1),
+            (FIELD_TIME, 4),
+        ] {
+            let (_, n) = encode_position(&sample(), FIELDS_DEFAULT | bit);
+            assert_eq!(n, base + width, "field {bit:#04x}");
+        }
+    }
+
+    /// A sender that adds a field and one that does not are both decodable
+    /// by the same receiver - the mask travels with the frame.
+    #[test]
+    fn mixed_senders_interoperate() {
+        let (lean, ln) = encode_position(&sample(), FIELDS_DEFAULT);
+        let (rich, rn) = encode_position(&sample(), FIELDS_DEFAULT | FIELD_ALT);
+        assert_eq!(decode_position(&lean[..ln]).unwrap().alt_dm, 0);
+        assert_eq!(decode_position(&rich[..rn]).unwrap().alt_dm, 1234);
+    }
+
+    /// 0x50 was the old fixed 20-byte layout. A frame from that firmware
+    /// must be refused, not read as a mask plus fields.
+    #[test]
+    fn old_position_tag_is_not_decoded() {
+        let mut old = [0u8; 21];
+        old[0] = 0x50;
+        old[1..].copy_from_slice(&sample().encode());
+        assert_eq!(decode_position(&old), None);
     }
 
     #[test]
     fn frame_roundtrip() {
-        let payload = encode_position(&sample());
+        let (payload, plen) = encode_position(&sample(), FIELDS_ALL);
+        let payload = &payload[..plen];
         let frame = Frame {
             src: 3,
             id: 42,
             hops_left: 1,
-            payload: &payload,
+            payload,
         };
         let mut buf = [0u8; FRAME_MAX];
         let n = frame.encode(&mut buf).unwrap();
@@ -178,9 +359,9 @@ mod tests {
 
     #[test]
     fn hops_survive_a_repeat() {
-        let payload = encode_position(&sample());
+        let (payload, plen) = encode_position(&sample(), FIELDS_ALL);
         let mut buf = [0u8; FRAME_MAX];
-        let n = Frame { src: 7, id: 9, hops_left: 2, payload: &payload }
+        let n = Frame { src: 7, id: 9, hops_left: 2, payload: &payload[..plen] }
             .encode(&mut buf)
             .unwrap();
 

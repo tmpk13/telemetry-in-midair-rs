@@ -10,7 +10,7 @@ serves everything over BLE to the gps-gui-rs app and manages power. See
 
 | Directory | What | Target |
 |-|-|-|
-| `proto/` | Shared no_std protocol crate: ESP<->WIO UART link framing, LoRa payloads, BLE extensions, `radio.toml` parser. Host-testable (`cargo test`). | any |
+| `proto/` | Shared no_std protocol crate: ESP<->WIO UART link framing, LoRa payloads, BLE extensions, `radio.cfg` parser. Host-testable (`cargo test`). | any |
 | `wio/` | WIO-E5 application firmware (RTIC). | `thumbv7em-none-eabi` (nightly) |
 | `wio/bootloader/` | Two-partition swap bootloader for UART-fed firmware updates. | `thumbv7em-none-eabi` |
 | `esp/` | ESP32-C6 firmware (embassy + trouble BLE). | `riscv32imac-unknown-none-elf` (stable) |
@@ -24,7 +24,7 @@ and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
 **Using Pixi**
 From `tools/` directory run
 `pixi run esp-upload`
-`pixi run fw-upload`
+`pixi run wio-upload`
 
 **Directly running**
 ```sh
@@ -52,7 +52,7 @@ over the link (used for update bookkeeping).
 
 ## Radio configuration
 
-The WIO loads `RADIO.TOML` from the SD card at boot; the same file can be
+The WIO loads `RADIO.CFG` from the SD card at boot; the same file can be
 pushed over BLE (bulk characteristic) at runtime, which also rewrites the
 SD copy. All keys are optional; defaults in parentheses:
 
@@ -72,6 +72,11 @@ max_hops = 1               # retransmissions allowed, 0-8 (1)
 
 [beacon]
 interval_s = 10            # position broadcast period, 0 = off (10)
+fields = "lat,lon"         # what each broadcast carries (lat,lon); also
+                           #   altitude|speed|course|sats|time
+
+[sd]
+sd_enabled = true          # use the SD card at all (true)
 
 [gps]                       # MAX-M10 receiver (UBX-CFG-VALSET, RAM layer)
 gps_enabled = true         # (true)
@@ -85,6 +90,23 @@ meas_rate_ms = 1000        # measurement/nav period, 25-10000 (1000)
 dynamic_model = "portable" # portable|stationary|pedestrian|automotive|
                            #   sea|airborne1g|airborne2g|airborne4g (portable)
 ```
+
+### Beacon payload
+
+`fields` decides what goes on the air. The default is position only: 13
+bytes per frame against the 24 a full GPS packet costs, so roughly half the
+air time on every broadcast. Altitude, speed, course, satellite count and
+time are still recorded in `GPSLOG.CSV` whether or not they are transmitted
+- the choice is only about what a *remote* receiver gets.
+
+`lat` and `lon` are required; a config that omits either is rejected. The
+selected set travels in the frame as a one-byte mask, so nodes configured
+differently interoperate: a receiver decodes whatever each sender chose to
+include, and fields nobody sent read back as zero.
+
+Air time is the scarce resource on a shared band, and it grows with the
+spreading factor - at SF12 a field costs about 32 times what it does at
+SF7. Add fields when a receiver needs them, not by default.
 
 ### Leaves and repeaters
 
@@ -224,9 +246,26 @@ awake board.
 
 ## SD card
 
-Normal FAT16/32 card. `GPSLOG.CSV` gets one line per own/remote fix
+`GPSLOG.CSV` gets one line per own/remote fix
 (`ms,src,lat_e7,lon_e7,alt_dm,speed_cms,course_cdeg,sats,fix,rssi`);
-readable in any spreadsheet. The card is optional and hot-pluggable.
+readable in any spreadsheet. The card is optional and hot-pluggable - when
+none is present the driver retries the mount once a minute, so a card
+inserted later starts logging within that. Only about the last 20 seconds of
+positions are buffered in RAM while no card is mounted; anything older is
+dropped. `sd_enabled = false` shuts the card down entirely.
+
+Formatting: **MBR partition table, first partition FAT16 or FAT32**. That is
+what a card of 32 GB or less already ships as, so most cards work untouched.
+Larger (SDXC) cards ship exFAT, which is not supported and must be
+reformatted - use the SD Association's SD Card Formatter, or on Linux make
+an MBR partition of type `0c` and `mkfs.vfat -F 32 /dev/sdX1`. Formatting
+the whole device (`/dev/sdX`, no partition) produces a card the driver
+cannot mount. GPT is not supported either.
+
+Both filenames are MS-DOS 8.3 - eight characters plus a three-character
+extension - which is why the config file is `RADIO.CFG` and not
+`RADIO.TOML`. The FAT layer converts a name to 8.3 before looking it up, so
+a longer name is not a missing file but one that can never be opened.
 
 ## WIO firmware update
 

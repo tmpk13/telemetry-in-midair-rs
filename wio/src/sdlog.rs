@@ -5,7 +5,7 @@
 //!
 //! - `GPSLOG.CSV` - appended position log, one line per own/remote fix:
 //!   `ms,src,lat_e7,lon_e7,alt_dm,speed_cms,course_cdeg,sats,fix,rssi`
-//! - `RADIO.TOML` - the radio configuration (see midair-proto's radiocfg),
+//! - `RADIO.CFG` - the radio configuration (see midair-proto's radiocfg),
 //!   read at boot and rewritten when a new config arrives over the link.
 //!
 //! The card is fully optional: the logger buffers lines in RAM and drops
@@ -25,15 +25,22 @@ use gps_proto::packet::{PositionPacket, FLAG_FIX};
 
 use crate::sdcard::{SdCard, SdError};
 
+// Both names must be valid MS-DOS 8.3 - at most eight characters, then at
+// most three of extension. The FAT layer converts a &str to a short name
+// before it looks anything up, so an over-long name is not a failed lookup
+// but a name that can never be opened or created at all.
 pub const LOG_FILE: &str = "GPSLOG.CSV";
-pub const CONFIG_FILE: &str = "RADIO.TOML";
+pub const CONFIG_FILE: &str = "RADIO.CFG";
 
 const LOG_HEADER: &str = "ms,src,lat_e7,lon_e7,alt_dm,speed_cms,course_cdeg,sats,fix,rssi\n";
 
 /// Flush the pending buffer to the card this often.
 const FLUSH_MS: u32 = 5_000;
-/// Retry card init this often while absent/failing.
-const RETRY_MS: u32 = 10_000;
+/// Retry card init this often while absent/failing. Each attempt clocks the
+/// SPI bus and powers the card through its init sequence, so on a board with
+/// no card fitted this is pure standby cost; a minute keeps hot-plug working
+/// without paying for it every ten seconds forever.
+const RETRY_MS: u32 = 60_000;
 /// Pending line buffer; ~8 lines of headroom between flushes.
 const PENDING_LEN: usize = 1024;
 /// Largest config file we handle.
@@ -97,6 +104,8 @@ pub struct SdLog {
     header_needed: bool,
     next_flush_ms: u32,
     next_retry_ms: u32,
+    /// Cleared by [`disable`](Self::disable) to shut the card down for good.
+    enabled: bool,
 }
 
 impl SdLog {
@@ -109,12 +118,26 @@ impl SdLog {
             header_needed: false,
             next_flush_ms: 0,
             next_retry_ms: 0,
+            enabled: true,
         }
+    }
+
+    /// Shut the card down and stop touching it: unmounts, drops whatever is
+    /// still buffered, and makes every later call a no-op.
+    ///
+    /// This is one-way by design. The config that asks for it lives on the
+    /// card, so the card has to be mounted and read before the setting is
+    /// even known - "disabled" therefore means "stop now", not "never
+    /// started", and re-enabling it would mean a reboot anyway.
+    pub fn disable(&mut self, now_ms: u32) {
+        self.unmount(now_ms);
+        self.pending_len = 0;
+        self.enabled = false;
     }
 
     /// Whether a card is mounted and logging.
     pub fn ready(&self) -> bool {
-        self.mounted.is_some()
+        self.enabled && self.mounted.is_some()
     }
 
     /// Drop the mount and card state so the retry path starts over.
@@ -157,6 +180,9 @@ impl SdLog {
     /// Periodic driver: mounts/retries the card and flushes the pending
     /// buffer. Call from the main loop; feeds no watchdog itself.
     pub fn poll(&mut self, now_ms: u32) {
+        if !self.enabled {
+            return;
+        }
         if self.mounted.is_none() {
             if now_ms.wrapping_sub(self.next_retry_ms) < 0x8000_0000 {
                 self.try_mount(now_ms);
@@ -206,6 +232,9 @@ impl SdLog {
     /// Queue a position line. `src` 0 = local GPS; `rssi` is the LoRa RSSI
     /// for remote positions (0 for local).
     pub fn log_position(&mut self, now_ms: u32, src: u8, rssi: i16, p: &PositionPacket) {
+        if !self.enabled {
+            return;
+        }
         use core::fmt::Write as _;
         struct Buf<'a>(&'a mut [u8], usize);
         impl core::fmt::Write for Buf<'_> {
@@ -243,7 +272,7 @@ impl SdLog {
         self.pending_len += len;
     }
 
-    /// Read `RADIO.TOML` into `buf`, returning the length read.
+    /// Read `RADIO.CFG` into `buf`, returning the length read.
     pub fn read_config(&mut self, buf: &mut [u8]) -> Option<usize> {
         let m = self.mounted.as_ref()?;
         let root = m.root;
@@ -253,9 +282,12 @@ impl SdLog {
         n
     }
 
-    /// Write (replace) `RADIO.TOML`. Returns `false` when no card is
+    /// Write (replace) `RADIO.CFG`. Returns `false` when no card is
     /// mounted or the write failed.
     pub fn write_config(&mut self, now_ms: u32, bytes: &[u8]) -> bool {
+        if !self.enabled {
+            return false;
+        }
         let Some(m) = &self.mounted else { return false };
         let root = m.root;
         let ok = (|| -> Result<(), ()> {

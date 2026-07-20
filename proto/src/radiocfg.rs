@@ -1,6 +1,10 @@
-//! Radio configuration: the `radio.toml` file format and its parser.
+//! Radio configuration: the `RADIO.CFG` file format and its parser.
 //!
-//! The WIO-E5 loads this from the SD card at boot (`RADIO.TOML`) and/or
+//! The file is TOML-shaped but the name is not `.toml`: it lives in the root
+//! of a FAT card, where 8.3 short names allow only a three-character
+//! extension.
+//!
+//! The WIO-E5 loads this from the SD card at boot (`RADIO.CFG`) and/or
 //! receives it over UART from the ESP32-C6 (which in turn gets it over
 //! BLE). No TOML crate runs on these targets, so this is a small no_std
 //! parser for the subset the file needs: `key = value` pairs with integer,
@@ -26,6 +30,8 @@
 //! [beacon]
 //! interval_s = 10           # position broadcast period
 //! ```
+
+use crate::lora;
 
 /// What a node does with frames that did not originate on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +175,17 @@ pub struct RadioConfig {
     pub max_hops: u8,
     /// Position broadcast interval in seconds (0 disables the beacon).
     pub beacon_interval_s: u16,
+    /// Which [`PositionPacket`](gps_proto::packet::PositionPacket) fields the
+    /// beacon puts on the air, as a mask of the `FIELD_*` bits in
+    /// [`crate::lora`]. Every extra field is airtime paid on every
+    /// broadcast, so the default carries position and nothing else.
+    ///
+    /// The mask travels in the frame, so nodes disagreeing about it is fine:
+    /// a receiver decodes whatever the sender chose to include.
+    pub beacon_fields: u8,
+    /// Whether the SD card is used at all. False stops logging, config
+    /// read-back and the card's power draw.
+    pub sd_enabled: bool,
     /// GPS receiver configuration.
     pub gps: GpsConfig,
 }
@@ -193,6 +210,11 @@ impl Default for RadioConfig {
             // fleet works without reconfiguring the nodes already deployed.
             max_hops: 1,
             beacon_interval_s: 10,
+            // Position only. Everything else a fix produces is written to
+            // the SD log, where a byte costs nothing, rather than spent on
+            // air time that has to be paid on every single broadcast.
+            beacon_fields: crate::lora::FIELDS_DEFAULT,
+            sd_enabled: true,
             gps: GpsConfig::default(),
         }
     }
@@ -362,6 +384,16 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 }
                 cfg.beacon_interval_s = v as u16;
             }
+            "fields" | "beacon_fields" => {
+                cfg.beacon_fields = parse_fields(value).ok_or(ConfigError::BadValue(lineno))?;
+                // Position is the whole point of the broadcast, and a
+                // receiver has nothing to plot without it.
+                if cfg.beacon_fields & lora::FIELDS_REQUIRED != lora::FIELDS_REQUIRED {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+            }
+            // -- [sd] -------------------------------------------------------
+            "sd_enabled" => cfg.sd_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
             // -- [gps] ------------------------------------------------------
             "gps_enabled" => cfg.gps.gps_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
             "glonass_enabled" => cfg.gps.glonass_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
@@ -432,6 +464,27 @@ fn parse_i64(s: &str) -> Option<i64> {
     };
     let v = parse_u64(digits)? as i64;
     Some(if neg { -v } else { v })
+}
+
+/// Parse a comma-separated beacon field list ("lat,lon,altitude") into a
+/// [`crate::lora`] field mask. An empty list is rejected: writing `""` reads
+/// like "send nothing", which is not a thing a beacon can do, so it is a
+/// mistake worth reporting rather than silently accepting.
+fn parse_fields(value: &str) -> Option<u8> {
+    let mut mask = 0u8;
+    for name in unquote(value).split(',') {
+        mask |= match name.trim() {
+            "lat" | "latitude" => lora::FIELD_LAT,
+            "lon" | "longitude" => lora::FIELD_LON,
+            "alt" | "altitude" => lora::FIELD_ALT,
+            "speed" => lora::FIELD_SPEED,
+            "course" => lora::FIELD_COURSE,
+            "sats" => lora::FIELD_SATS,
+            "time" => lora::FIELD_TIME,
+            _ => return None,
+        };
+    }
+    Some(mask)
 }
 
 fn parse_bool(s: &str) -> Option<bool> {
@@ -559,6 +612,45 @@ mod tests {
         assert!(cfg.ldro());
         cfg.spreading_factor = 10;
         assert!(!cfg.ldro());
+    }
+
+    #[test]
+    fn beacon_fields_default_to_position_only() {
+        let cfg = RadioConfig::default();
+        assert_eq!(cfg.beacon_fields, lora::FIELD_LAT | lora::FIELD_LON);
+        assert_eq!(lora::position_msg_len(cfg.beacon_fields), 10);
+    }
+
+    #[test]
+    fn beacon_fields_parse() {
+        let mask = parse("fields = \"lat,lon,altitude,time\"").unwrap().beacon_fields;
+        assert_eq!(
+            mask,
+            lora::FIELD_LAT | lora::FIELD_LON | lora::FIELD_ALT | lora::FIELD_TIME
+        );
+        // Whitespace, the short spellings and the aliased key all work.
+        assert_eq!(
+            parse("beacon_fields = \"lat, lon, alt\"").unwrap().beacon_fields,
+            lora::FIELD_LAT | lora::FIELD_LON | lora::FIELD_ALT
+        );
+        assert_eq!(parse("fields = \"lat,lon\"").unwrap(), RadioConfig::default());
+    }
+
+    #[test]
+    fn beacon_fields_reject_nonsense() {
+        // Unknown field name.
+        assert_eq!(parse("fields = \"lat,lon,heading\""), Err(ConfigError::BadValue(1)));
+        // A broadcast without a position is not a position broadcast.
+        assert_eq!(parse("fields = \"altitude\""), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("fields = \"lat\""), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("fields = \"\""), Err(ConfigError::BadValue(1)));
+    }
+
+    #[test]
+    fn sd_can_be_disabled() {
+        assert!(RadioConfig::default().sd_enabled);
+        assert!(!parse("sd_enabled = false").unwrap().sd_enabled);
+        assert_eq!(parse("sd_enabled = yes"), Err(ConfigError::BadValue(1)));
     }
 
     #[test]

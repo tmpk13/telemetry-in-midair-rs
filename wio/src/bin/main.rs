@@ -8,7 +8,7 @@
 //! - Talks to the ESP32-C6 on USART2 (PA2 TX / PA3 RX): positions and
 //!   status out; sleep/config/firmware commands in. Radio-busy flags run
 //!   both ways so the two radios can avoid transmitting at once.
-//! - Radio parameters come from `RADIO.TOML` on the SD card and/or a
+//! - Radio parameters come from `RADIO.CFG` on the SD card and/or a
 //!   config pushed over the link (which is also saved back to SD).
 //! - Accepts firmware images over the link into the DFU partition; the
 //!   swap bootloader (see `bootloader/`) installs them on reboot.
@@ -123,11 +123,11 @@ mod app {
         let (cfg, cfg_loaded) = match sdlog.read_config(&mut cfg_buf) {
             Some(n) => match radiocfg::parse_bytes(&cfg_buf[..n]) {
                 Ok(c) => {
-                    rprintln!("Config: RADIO.TOML loaded (address {})", c.address);
+                    rprintln!("Config: RADIO.CFG loaded (address {})", c.address);
                     (c, true)
                 }
                 Err(e) => {
-                    rprintln!("Config: RADIO.TOML invalid ({:?}), using defaults", e);
+                    rprintln!("Config: RADIO.CFG invalid ({:?}), using defaults", e);
                     (RadioConfig::default(), false)
                 }
             },
@@ -136,6 +136,12 @@ mod app {
                 (RadioConfig::default(), false)
             }
         };
+        // Honor sd_enabled only now: the setting itself lives on the card,
+        // so the card has to be read before it can say to stop using it.
+        if !cfg.sd_enabled {
+            rprintln!("SD: disabled by config");
+            sdlog.disable(platform::millis());
+        }
 
         // SubGHz radio (integrated SX1262).
         let sg = SubGhz::new(dp.SPI3, &mut rcc);
@@ -414,12 +420,13 @@ mod app {
             // ---- LoRa position beacon --------------------------------------
             if cfg.beacon_interval_s != 0 && due(now, next_beacon) {
                 if gps.has_fix() && !esp.peer_busy(now) {
-                    let data = lora::encode_position(&gps.packet());
+                    let (data, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
+                    let data = &data[..n];
                     // Warn the ESP off the air for as long as the blocking
                     // transmit can hold the radio.
                     esp.send(msg::RADIO_BUSY, &[1]);
                     busy_clear_at = Some(now.wrapping_add(cfg.tx_poll_timeout_ms()));
-                    match node.broadcast(&data) {
+                    match node.broadcast(data) {
                         Ok(()) => tx_count += 1,
                         Err(e) => debug_println!("Beacon TX failed: {:?}", e),
                     }
