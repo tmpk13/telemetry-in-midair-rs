@@ -27,3 +27,18 @@ Go mode. Should sleep cycle the ESP, and send the gps coordinates over the radio
 
 
 SD logging to file?
+
+
+Wake-on-radio: SetRxDutyCycle (0x94), exposed by the HAL as
+set_rx_duty_cycle. The radio cycles sleep/RX on its own and only wakes the
+MCU when a real preamble arrives, instead of the MCU holding continuous RX.
+Biggest battery win available on a leaf that mostly listens. Needs the
+receive loop restructured and the sleep/RX ratio picked against the beacon
+interval: too long asleep and a whole broadcast passes unheard, so the two
+have to be chosen together.
+
+CAD auto-transitions: SetCadParams (0x88) with ExitMode. Detect a preamble
+and let the chip drop straight into RX to catch the payload, or find the
+channel clear and go straight to TX. Cheaper than a full RX window for
+listen-before-talk, and it would give repeaters a real collision check
+before forwarding rather than the current random jitter.
