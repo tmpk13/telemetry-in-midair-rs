@@ -16,8 +16,9 @@
 //! - Radio TOML config and WIO firmware images pushed through the bulk
 //!   characteristic and streamed over the UART link
 //!
-//! LED D2 (GPIO3): double blink on a sleep-interval wake, short burst on
-//! config writes from the phone, fast toggling during a firmware upload.
+//! LED D2 (GPIO3): one long blink at the start of a sleep-interval wake,
+//! short burst on config writes from the phone, fast toggling during a
+//! firmware upload.
 //!
 //! Radio coordination: while the WIO flags a LoRa transmission the
 //! notifier skips its ticks; while a bulk transfer runs the C6 flags
@@ -392,7 +393,8 @@ async fn pulse_wio_reset() {
 
 #[derive(Clone, Copy)]
 enum Blink {
-    /// Two blinks: woke up on the sleep interval.
+    /// One long blink: woke up on the sleep interval, advertising window
+    /// is starting.
     Wake,
     /// Short burst: info/config received from the phone.
     Info,
@@ -414,12 +416,9 @@ async fn led_task(mut led: Output<'static>) {
     loop {
         match LED_CHANNEL.receive().await {
             Blink::Wake => {
-                for _ in 0..2 {
-                    led.set_high();
-                    Timer::after(Duration::from_millis(60)).await;
-                    led.set_low();
-                    Timer::after(Duration::from_millis(60)).await;
-                }
+                led.set_high();
+                Timer::after(Duration::from_millis(500)).await;
+                led.set_low();
             }
             Blink::Info => {
                 for _ in 0..3 {

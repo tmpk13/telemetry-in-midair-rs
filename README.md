@@ -145,7 +145,7 @@ Config command ids (config characteristic, `[id, len, value]`):
 
 `0x13` is the only sleep control. While set, the C6 deep-sleeps whenever
 no central is connected and wakes every interval to advertise for 15 s
-(double D2 blink). It persists until changed - a connect does not clear
+(one long D2 blink). It persists until changed - a connect does not clear
 it, so an unattended board holds its cadence indefinitely and the setting
 means the same thing whether or not anyone is looking.
 
