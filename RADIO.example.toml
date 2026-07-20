@@ -45,16 +45,21 @@ rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for 
 # Low-data-rate optimization is derived automatically from spreading
 # factor and bandwidth; there is no key for it.
 
-# -- Mesh ---------------------------------------------------------------
-[mesh]
+# -- Network ------------------------------------------------------------
+# Everything is broadcast. Leaves hear each other directly, so a fleet of
+# nothing but leaves is a working network and these defaults need no
+# changing. A repeater is for covering ground no pair of leaves can reach
+# across on their own.
+[network]
 address = 1
-address_description = "This node's mesh address, 1-255."
+address_description = "This node's address, 1-255. Must be unique on the network - it is how receivers tell one sender's positions from another's."
 
-listen_ms = 200
-listen_ms_description = "Channel listen window before transmitting, in ms, 10-60000. Must exceed one packet's air time; raise it for slow presets (SF12, narrow bandwidth)."
+role = "leaf"
+role_description = "leaf transmits and receives only. repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards."
+role_type = "enum:leaf,repeater"
 
-lifetime = 2
-lifetime_description = "Broadcast hop count, 1-16. Values >=2 let nodes repeat the packet."
+max_hops = 1
+max_hops_description = "Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no repeater forwards it; 1 covers a single-repeater deployment. This is a property of the sender, so raising it does not require touching the repeaters."
 
 # -- Beacon -------------------------------------------------------------
 [beacon]

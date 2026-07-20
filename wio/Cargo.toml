@@ -23,9 +23,6 @@ panic-halt = "1.0"
 rtt-target = "0.6.2"
 rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "2.1.0", features = ["cortex-m-systick"] }
-embedded-nano-mesh = "2.1.11"
-# embedded-nano-mesh 2.1.x bounds its IO on embedded-io 0.6; do not bump.
-embedded-io = "0.6"
 nb = "1"
 # SPSC ring buffer: the USART2 (ESP link) RX interrupt fills it, the main
 # loop drains it. Same version RTIC already pulls in.

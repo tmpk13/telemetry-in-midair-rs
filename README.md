@@ -2,9 +2,9 @@
 [Kicad Board](https://github.com/tmpk13/telemetry-in-midair) https://github.com/tmpk13/telemetry-in-midair
 
 GPS tracker board firmware: a WIO-E5 (STM32WLE5) reads a MAX-M10 GPS,
-broadcasts positions over a 915 MHz LoRa mesh and logs to SD, while an
-ESP32-C6 serves everything over BLE to the gps-gui-rs app and manages
-power. See `PLAN.md` for the intent.
+broadcasts positions over 915 MHz LoRa and logs to SD, while an ESP32-C6
+serves everything over BLE to the gps-gui-rs app and manages power. See
+`PLAN.md` for the intent.
 
 ## Layout
 
@@ -65,10 +65,10 @@ coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
 rx_boost = false           # boosted RX gain (false)
 
-[mesh]
+[network]
 address = 1                # 1-255 (1)
-listen_ms = 200            # (200)
-lifetime = 2               # broadcast hop count; >=2 repeats (2)
+role = "leaf"              # leaf | repeater (leaf)
+max_hops = 1               # retransmissions allowed, 0-8 (1)
 
 [beacon]
 interval_s = 10            # position broadcast period, 0 = off (10)
@@ -86,8 +86,33 @@ dynamic_model = "portable" # portable|stationary|pedestrian|automotive|
                            #   sea|airborne1g|airborne2g|airborne4g (portable)
 ```
 
-Raise `listen_ms` together with slow presets (SF12 etc.) - the listen
-window must exceed one packet's air time.
+### Leaves and repeaters
+
+Every transmission is a broadcast and every node listens continuously, so
+a fleet of plain leaves already works: each hears whichever others are in
+direct range, and the defaults above need no changing. Setting `role =
+"repeater"` on one node makes it retransmit what it hears, which is how
+you cover ground no pair of leaves can reach across directly. Give a
+repeater the elevation and the antenna - that, not the protocol, is where
+the range comes from.
+
+`max_hops` belongs to the *sender*: it is the number of retransmissions
+that node's own broadcasts are allowed, stamped into each frame as it goes
+out. A repeater forwards anything still carrying hops, so dropping one
+into an existing fleet works without reconfiguring the nodes already
+deployed. Frames are identified by sender and sequence number, so a frame
+that arrives twice is handled once and two repeaters cannot bounce one
+back and forth.
+
+Each hop is another full transmission of the same frame on a shared
+channel. `max_hops = 1` is the setting that pays; past 2 the traffic grows
+faster than the coverage.
+
+A frame is 3 header bytes plus the payload at its true length, with no
+padding - a 20-byte position costs 24 bytes on air. Air time is the budget
+that buys spreading factor, and spreading factor is the largest range knob
+here (SF7 to SF12 is roughly 12 dB), so the framing is kept small to leave
+room for a slow preset.
 
 `rx_boost` is the one link-budget key that is not symmetric: it buys
 roughly +2 dB of sensitivity on the node it is set on, and does nothing

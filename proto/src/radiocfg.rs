@@ -20,12 +20,24 @@
 //!
 //! [mesh]
 //! address = 1               # 1-255
-//! listen_ms = 200
-//! lifetime = 2              # broadcast hop count
+//! role = "leaf"             # leaf | repeater
+//! max_hops = 1              # retransmissions allowed per broadcast
 //!
 //! [beacon]
 //! interval_s = 10           # position broadcast period
 //! ```
+
+/// What a node does with frames that did not originate on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Originates its own broadcasts and receives everyone else's, but
+    /// never retransmits. A network of nothing but leaves works: every
+    /// node hears every other one that is in direct range.
+    Leaf,
+    /// A leaf that additionally retransmits frames still carrying hops,
+    /// extending the network past one radio horizon.
+    Repeater,
+}
 
 /// GPS receiver power mode (u-blox M10 `CFG-PM-OPERATEMODE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,12 +155,18 @@ pub struct RadioConfig {
     /// saving and boosted), so this is a bool rather than an enum - the
     /// intermediate values have no specified behavior to expose.
     pub rx_boost: bool,
-    /// Mesh node address (1-255).
+    /// This node's address (1-255). Must be unique on the network: it is
+    /// how receivers tell one sender's positions from another's.
     pub address: u8,
-    /// Mesh listen period before transmitting (ms).
-    pub listen_ms: u32,
-    /// Broadcast hop-count lifetime (>= 2 lets nodes repeat).
-    pub lifetime: u8,
+    /// Whether this node retransmits other nodes' frames.
+    pub role: Role,
+    /// Retransmissions allowed for a broadcast this node originates, i.e.
+    /// the `hops_left` it stamps into the frame. 0 means no repeater will
+    /// forward it; 1 covers the usual single-repeater deployment.
+    ///
+    /// This is a property of the sender, not of the repeaters, so raising
+    /// it on one node does not require touching any other.
+    pub max_hops: u8,
     /// Position broadcast interval in seconds (0 disables the beacon).
     pub beacon_interval_s: u16,
     /// GPS receiver configuration.
@@ -168,9 +186,12 @@ impl Default for RadioConfig {
             // which is a trade to opt into rather than inherit.
             rx_boost: false,
             address: 1,
-            listen_ms: 200,
-            // 2 hops so any node also acts as a repeater by default.
-            lifetime: 2,
+            // Leaf by default: repeating is a job you give one well-placed
+            // node, not something every node should do to every frame.
+            role: Role::Leaf,
+            // Allow one repeat, so dropping a repeater into an existing
+            // fleet works without reconfiguring the nodes already deployed.
+            max_hops: 1,
             beacon_interval_s: 10,
             gps: GpsConfig::default(),
         }
@@ -208,7 +229,23 @@ impl RadioConfig {
     pub fn tx_chip_timeout_ms(&self) -> u32 {
         self.tx_poll_timeout_ms() + 500
     }
+
+    /// Upper bound of the random delay a repeater waits before forwarding
+    /// a frame (ms).
+    ///
+    /// Two repeaters that hear the same broadcast would otherwise answer it
+    /// at the same instant and collide every time, so the wait has to span
+    /// enough air time for one of them to win outright - hence scaling with
+    /// the modulation rather than a fixed number of milliseconds.
+    pub fn repeat_jitter_ms(&self) -> u32 {
+        100 * self.airtime_scale()
+    }
 }
+
+/// Ceiling on [`RadioConfig::max_hops`]. Each hop costs another full
+/// transmission of the same frame on a shared channel, so the useful range
+/// is small and the limit exists to keep a typo from flooding the band.
+pub const MAX_HOPS_LIMIT: u8 = 8;
 
 /// Config parse/validation errors. The u32 is the offending line number
 /// (1-based) where one applies.
@@ -294,19 +331,29 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 }
                 cfg.address = v as u8;
             }
-            "listen_ms" => {
+            "role" => {
+                cfg.role = match unquote(value) {
+                    "leaf" => Role::Leaf,
+                    "repeater" => Role::Repeater,
+                    _ => return Err(ConfigError::BadValue(lineno)),
+                };
+            }
+            "max_hops" => {
                 let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(10..=60_000).contains(&v) {
+                if v > MAX_HOPS_LIMIT as u64 {
                     return Err(ConfigError::OutOfRange(lineno));
                 }
-                cfg.listen_ms = v as u32;
+                cfg.max_hops = v as u8;
             }
+            // Accepted so cards written for the old mesh keep the hop count
+            // their author intended: it counted transmissions, where
+            // max_hops counts only the retransmissions after the first.
             "lifetime" => {
                 let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
                 if !(1..=16).contains(&v) {
                     return Err(ConfigError::OutOfRange(lineno));
                 }
-                cfg.lifetime = v as u8;
+                cfg.max_hops = ((v - 1) as u8).min(MAX_HOPS_LIMIT);
             }
             "interval_s" | "beacon_interval_s" => {
                 let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
@@ -429,8 +476,8 @@ mod tests {
 
             [mesh]
             address = 3
-            listen_ms = 900
-            lifetime = 3
+            role = "repeater"
+            max_hops = 2
 
             [beacon]
             interval_s = 30
@@ -442,10 +489,41 @@ mod tests {
         assert_eq!(cfg.power_dbm, 14);
         assert!(cfg.rx_boost);
         assert_eq!(cfg.address, 3);
-        assert_eq!(cfg.listen_ms, 900);
-        assert_eq!(cfg.lifetime, 3);
+        assert_eq!(cfg.role, Role::Repeater);
+        assert_eq!(cfg.max_hops, 2);
         assert_eq!(cfg.beacon_interval_s, 30);
         assert!(!cfg.ldro());
+    }
+
+    #[test]
+    fn role_defaults_to_leaf_with_one_repeat_allowed() {
+        let cfg = RadioConfig::default();
+        assert_eq!(cfg.role, Role::Leaf);
+        assert_eq!(cfg.max_hops, 1);
+        assert_eq!(parse("role = \"leaf\"").unwrap().role, Role::Leaf);
+        assert_eq!(parse("max_hops = 0").unwrap().max_hops, 0);
+        assert_eq!(parse("role = repeater").unwrap().role, Role::Repeater);
+        assert_eq!(parse("role = \"gateway\""), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("max_hops = 9"), Err(ConfigError::OutOfRange(1)));
+    }
+
+    #[test]
+    fn legacy_lifetime_maps_to_hop_count() {
+        // The old key counted transmissions; 2 meant "one repeat".
+        assert_eq!(parse("lifetime = 2").unwrap().max_hops, 1);
+        assert_eq!(parse("lifetime = 1").unwrap().max_hops, 0);
+        assert_eq!(parse("lifetime = 16").unwrap().max_hops, MAX_HOPS_LIMIT);
+        assert_eq!(parse("lifetime = 0"), Err(ConfigError::OutOfRange(1)));
+        // listen_ms is gone; an old card carrying it still parses.
+        assert_eq!(parse("listen_ms = 900").unwrap(), RadioConfig::default());
+    }
+
+    #[test]
+    fn repeat_jitter_tracks_air_time() {
+        let mut cfg = RadioConfig::default();
+        let fast = cfg.repeat_jitter_ms();
+        cfg.spreading_factor = 12;
+        assert!(cfg.repeat_jitter_ms() > fast);
     }
 
     #[test]

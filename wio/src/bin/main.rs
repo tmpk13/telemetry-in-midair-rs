@@ -1,8 +1,9 @@
 //! WIO-E5 firmware for the telemetry-in-midair board.
 //!
 //! - Reads the MAX-M10 GPS on USART1 (PB6 TX / PB7 RX, EXTINT on PB10).
-//! - Broadcasts positions over the 915 MHz LoRa mesh (embedded-nano-mesh,
-//!   so every node also repeats) and blinks D6 (PA9) on RX, D5 (PA10) on TX.
+//! - Broadcasts positions over 915 MHz LoRa and blinks D6 (PA9) on RX,
+//!   D5 (PA10) on TX. Nodes are leaves by default and hear each other
+//!   directly; one configured as a repeater extends that range.
 //! - Logs own and remote positions to a FAT SD card (SPI1 + PA0 CS).
 //! - Talks to the ESP32-C6 on USART2 (PA2 TX / PA3 RX): positions and
 //!   status out; sleep/config/firmware commands in. Radio-busy flags run
@@ -45,7 +46,7 @@ mod app {
     use wio_e5_gps::sdcard::SdCard;
     use wio_e5_gps::sdlog::SdLog;
     use wio_e5_gps::watchdog;
-    use wio_e5_gps::{status_println, LoraIo, MeshNode, FIRMWARE_VERSION};
+    use wio_e5_gps::{status_println, Node, FIRMWARE_VERSION};
 
     /// `a` happened at or after deadline `b` in wrapping-u32 time.
     fn due(now: u32, deadline: u32) -> bool {
@@ -57,8 +58,7 @@ mod app {
 
     #[local]
     struct Local {
-        io: LoraIo<Sx1262Driver>,
-        mesh: MeshNode,
+        node: Node<Sx1262Driver>,
         gps: Gps,
         sdlog: SdLog,
         esp: EspLink,
@@ -160,17 +160,19 @@ mod app {
         // gps::BAUD, so push the configured GNSS/power settings now.
         gps.configure(&cfg.gps);
 
-        let io = LoraIo::new(radio);
-        let mesh = MeshNode::new(cfg.address, cfg.listen_ms);
-        rprintln!("Mesh node {} ready", cfg.address);
+        let node = Node::new(radio, &cfg);
+        rprintln!(
+            "Node {} ready ({})",
+            cfg.address,
+            if node.is_repeater() { "repeater" } else { "leaf" }
+        );
 
         run::spawn().unwrap();
 
         (
             Shared {},
             Local {
-                io,
-                mesh,
+                node,
                 gps,
                 sdlog,
                 esp,
@@ -194,10 +196,9 @@ mod app {
         esplink::drain_rx_isr(cx.local.esp_rx_prod);
     }
 
-    #[task(local = [io, mesh, gps, sdlog, esp, leds, flash, iwdg, fw, cfgxfer, cfg, cfg_loaded], priority = 1)]
+    #[task(local = [node, gps, sdlog, esp, leds, flash, iwdg, fw, cfgxfer, cfg, cfg_loaded], priority = 1)]
     async fn run(cx: run::Context) {
-        let io = cx.local.io;
-        let mesh = cx.local.mesh;
+        let node = cx.local.node;
         let gps = cx.local.gps;
         let sdlog = cx.local.sdlog;
         let esp = cx.local.esp;
@@ -252,11 +253,11 @@ mod app {
                     cmd::WIO_SLEEP => {
                         let sleep = esp.payload().first() == Some(&1);
                         if sleep && !sleeping {
-                            io.inner().standby();
+                            node.radio_mut().standby();
                             sleeping = true;
                             status_println!(esp, "soft sleep");
                         } else if !sleep && sleeping {
-                            io.inner().init(cfg);
+                            node.radio_mut().init(cfg);
                             sleeping = false;
                             status_println!(esp, "woke from soft sleep");
                         }
@@ -284,14 +285,10 @@ mod app {
                     cmd::CFG_END => match cfgxfer.end(esp.payload()) {
                         CfgEvent::Complete => match radiocfg::parse_bytes(cfgxfer.bytes()) {
                             Ok(new_cfg) => {
-                                let remesh = new_cfg.address != cfg.address
-                                    || new_cfg.listen_ms != cfg.listen_ms;
                                 let regps = new_cfg.gps != cfg.gps;
                                 *cfg = new_cfg;
-                                io.inner().init(cfg);
-                                if remesh {
-                                    *mesh = MeshNode::new(cfg.address, cfg.listen_ms);
-                                }
+                                node.radio_mut().init(cfg);
+                                node.reconfigure(cfg);
                                 if regps && !gps.sleeping {
                                     gps.configure(&cfg.gps);
                                     status_println!(esp, "gps reconfigured");
@@ -349,7 +346,7 @@ mod app {
                 }
             }
 
-            // A firmware transfer owns the loop: skip GPS/SD/mesh work so
+            // A firmware transfer owns the loop: skip GPS/SD/radio work so
             // the link stays responsive and nothing else erases flash.
             if fw.is_active() {
                 watchdog::feed(iwdg);
@@ -418,10 +415,11 @@ mod app {
             if cfg.beacon_interval_s != 0 && due(now, next_beacon) {
                 if gps.has_fix() && !esp.peer_busy(now) {
                     let data = lora::encode_position(&gps.packet());
-                    // Warn the ESP off the air while the mesh transmits.
+                    // Warn the ESP off the air for as long as the blocking
+                    // transmit can hold the radio.
                     esp.send(msg::RADIO_BUSY, &[1]);
-                    busy_clear_at = Some(now.wrapping_add(2 * cfg.listen_ms + 500));
-                    match mesh.broadcast(&data, cfg.lifetime) {
+                    busy_clear_at = Some(now.wrapping_add(cfg.tx_poll_timeout_ms()));
+                    match node.broadcast(&data) {
                         Ok(()) => tx_count += 1,
                         Err(e) => debug_println!("Beacon TX failed: {:?}", e),
                     }
@@ -440,34 +438,43 @@ mod app {
                     busy_clear_at = None;
                 }
 
-            // ---- Mesh -------------------------------------------------------
-            mesh.update(io, platform::millis());
-            if let Some(m) = mesh.receive() {
+            // ---- LoRa receive -----------------------------------------------
+            if let Some(rx) = node.poll(now) {
                 rx_count += 1;
-                let rssi = io.last_rssi();
-                if let Some(p) = lora::decode_position(&m.data) {
-                    debug_println!("Position from node {} rssi={}", m.source, rssi);
+                if let Some(p) = lora::decode_position(rx.payload) {
+                    debug_println!("Position from node {} rssi={}", rx.src, rx.rssi);
                     let mut buf = [0u8; 3 + 20];
-                    buf[0] = m.source;
-                    buf[1..3].copy_from_slice(&rssi.to_le_bytes());
+                    buf[0] = rx.src;
+                    buf[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
                     buf[3..].copy_from_slice(&p.encode());
                     esp.send(msg::POSITION, &buf);
-                    sdlog.log_position(now, m.source, rssi, &p);
+                    sdlog.log_position(now, rx.src, rx.rssi, &p);
                 } else {
-                    // Forward other payloads verbatim (truncated to one frame).
-                    let mut buf = [0u8; 3 + 32];
-                    let n = m.data.len().min(32);
-                    buf[0] = m.source;
-                    buf[1..3].copy_from_slice(&rssi.to_le_bytes());
-                    buf[3..3 + n].copy_from_slice(&m.data[..n]);
+                    // Forward other payloads verbatim.
+                    let mut buf = [0u8; 3 + lora::PAYLOAD_MAX];
+                    let n = rx.payload.len().min(lora::PAYLOAD_MAX);
+                    buf[0] = rx.src;
+                    buf[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
+                    buf[3..3 + n].copy_from_slice(&rx.payload[..n]);
                     esp.send(msg::LORA_RX, &buf[..3 + n]);
+                }
+            }
+
+            // ---- Repeat forwarding ------------------------------------------
+            // Only a node configured as a repeater ever has one of these
+            // queued; a leaf-only network never enters this branch.
+            if node.repeat_due(now) && !esp.peer_busy(now) {
+                esp.send(msg::RADIO_BUSY, &[1]);
+                busy_clear_at = Some(now.wrapping_add(cfg.tx_poll_timeout_ms()));
+                if node.send_due_repeat(now) {
+                    tx_count += 1;
                 }
             }
 
             // ---- Periodic status to the ESP ---------------------------------
             if due(now, next_status) {
                 next_status = now.wrapping_add(5_000);
-                let secs_since_rx = match io.last_rx_ms() {
+                let secs_since_rx = match node.last_rx_ms() {
                     Some(t) => {
                         let s = platform::millis().wrapping_sub(t) / 1000;
                         s.min(0xFFFE) as u16
@@ -485,8 +492,8 @@ mod app {
                     flags |= link::TELEM_FLAG_CFG_LOADED;
                 }
                 let telem = Telemetry {
-                    last_rssi: io.last_rssi(),
-                    last_snr_cb: io.inner().last_snr_cb(),
+                    last_rssi: node.last_rssi(),
+                    last_snr_cb: node.radio().last_snr_cb(),
                     secs_since_rx,
                     rx_count,
                     tx_count,

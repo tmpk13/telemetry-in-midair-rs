@@ -198,6 +198,7 @@ impl Sx1262Driver {
                 &CfgIrq::new()
                     .irq_enable_all(Irq::RxDone)
                     .irq_enable_all(Irq::TxDone)
+                    .irq_enable_all(Irq::Err)
                     .irq_enable_all(Irq::Timeout),
             )
             .expect("set_irq_cfg");
@@ -288,7 +289,18 @@ impl PacketRadio for Sx1262Driver {
             return Ok(None);
         }
 
+        // The SX126x raises RxDone alongside Err when a packet arrives with
+        // a bad CRC, and the payload is still sitting in the buffer. Nothing
+        // above this layer checksums, so a corrupt packet handed up would be
+        // parsed as a real frame - drop it here.
+        let crc_bad = irq & Irq::Err.mask() != 0;
+
         let _ = self.radio.clear_irq_status(0xFFFF);
+
+        if crc_bad {
+            debug_println!("Dropped packet with bad CRC");
+            return Ok(None);
+        }
 
         let (_, len_u8, offset) = self
             .radio
@@ -376,8 +388,9 @@ impl PacketRadio for Sx1262Driver {
             }
         };
 
-        // Re-enter continuous RX immediately so the mesh listen period
-        // measures real channel activity from the moment TX ends.
+        // Re-enter continuous RX immediately: the node is deaf while it
+        // transmits, so every millisecond spent out of RX after TxDone is
+        // another chance to miss someone else's broadcast.
         if self.radio.set_rx(Timeout::DISABLED).is_ok() {
             self.wait_on_busy();
             self.rx_active = true;

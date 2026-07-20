@@ -59,8 +59,8 @@ pub mod cmd {
 
 pub mod msg {
     /// `[src u8, rssi i16le, PositionPacket 20B]` - a position report.
-    /// `src` 0 is the local GPS; other values are mesh node addresses whose
-    /// broadcast we received (rssi is then the LoRa RSSI in dBm).
+    /// `src` 0 is the local GPS; other values are the addresses of nodes
+    /// whose broadcast we received (rssi is then the LoRa RSSI in dBm).
     pub const POSITION: u8 = 0x40;
 
     /// [`super::Telemetry`] wire format - periodic link/radio status.
@@ -70,8 +70,8 @@ pub mod msg {
     /// defer discretionary BLE traffic; 0: clear. Expires like RADIO_BUSY.
     pub const RADIO_BUSY: u8 = 0x42;
 
-    /// `[src u8, rssi i16le, payload...]` - a non-position mesh payload,
-    /// forwarded verbatim.
+    /// `[src u8, rssi i16le, payload...]` - a received LoRa payload that is
+    /// not a position, forwarded verbatim.
     pub const LORA_RX: u8 = 0x43;
 
     /// `[text: ASCII bytes]` - a human-readable status/log line. The ESP

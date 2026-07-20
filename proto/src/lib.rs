@@ -7,7 +7,7 @@
 //! - [`link`]: the framed UART protocol between the ESP32-C6 and the WIO-E5
 //!   (USART2 on the WIO side), including firmware-update and radio-config
 //!   transfer commands.
-//! - [`lora`]: payload formats sent over the LoRa mesh.
+//! - [`lora`]: the LoRa over-air frame and the payloads it carries.
 //! - [`ble`]: BLE GATT extensions on top of the gps-proto service (extra
 //!   characteristic UUIDs and config command ids).
 //! - [`radiocfg`]: the radio TOML configuration file format and its parser.

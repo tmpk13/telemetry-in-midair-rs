@@ -1,6 +1,6 @@
 //! WIO-E5 (STM32WLE5JC) firmware library for the telemetry-in-midair board.
 //!
-//! The module owns the MAX-M10 GPS (USART1), the LoRa mesh (integrated
+//! The module owns the MAX-M10 GPS (USART1), the LoRa radio (integrated
 //! SX1262), the SD card (SPI1, FAT), and the UART link to the ESP32-C6
 //! (USART2). See `src/bin/main.rs` for the RTIC application tying it
 //! together.
@@ -33,7 +33,6 @@ pub mod cfgxfer;
 pub mod esplink;
 pub mod fwupdate;
 pub mod gps;
-pub mod io;
 pub mod leds;
 pub mod node;
 pub mod platform;
@@ -42,9 +41,7 @@ pub mod sdcard;
 pub mod sdlog;
 pub mod watchdog;
 
-pub use embedded_nano_mesh::{LifeTimeType, SendError};
-pub use io::LoraIo;
-pub use node::{MeshMessage, MeshNode};
+pub use node::{Node, Received, TxError};
 
 /// Firmware version reported over the link and used by the DFU handshake.
 /// Set at compile time via the `FW_VERSION` environment variable.
