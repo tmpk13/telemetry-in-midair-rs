@@ -25,6 +25,7 @@ Remove W.FL antenna add wire antenna (31 mm).
 
 Go mode. Should sleep cycle the ESP, and send the gps coordinates over the radio.
 
+SD card for 
 
 SD logging to file?
 
