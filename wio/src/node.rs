@@ -217,7 +217,13 @@ impl<R: PacketRadio> Node<R> {
             (f.src, f.id, f.hops_left)
         };
         // Our own broadcast, forwarded back to us by a repeater.
-        if src == self.address {
+        //
+        // Only a node that transmits can hear itself. One that does not has
+        // nothing of its own on the air, so a frame carrying its address
+        // really did come from someone else and dropping it would blind a
+        // receive-only base station to exactly one node - most likely the
+        // one that, like the base station, was left at the default address.
+        if self.role.transmits() && src == self.address {
             return None;
         }
         if self.mark_seen(src, id, now) {

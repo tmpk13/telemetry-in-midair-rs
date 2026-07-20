@@ -64,7 +64,7 @@ tcxo_startup_ms_description = "How long the radio waits for the TCXO to settle b
 # deployment where the reporting only ever runs one way.
 [network]
 address = 1
-address_description = "This node's address, 1-255. Must be unique on the network. Two nodes sharing an address are mutually deaf: each drops the other's broadcasts as an echo of its own, so neither ever sees the other."
+address_description = "This node's address, 1-255. Must be unique among the nodes that transmit: two senders sharing an address are mutually deaf, each dropping the other's broadcasts as an echo of its own, so neither ever sees the other. An rx_only node never puts its address on the air, so it can keep the default."
 
 role = "leaf"
 role_description = "leaf transmits its own position and receives everyone else's. Repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards. tx_only beacons without ever switching the receiver on, which is the largest power saving available to a node nobody needs to track from. rx_only listens without ever transmitting, for a base station that only collects."

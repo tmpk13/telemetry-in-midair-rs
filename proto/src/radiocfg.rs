@@ -228,10 +228,15 @@ pub struct RadioConfig {
     /// saving and boosted), so this is a bool rather than an enum - the
     /// intermediate values have no specified behavior to expose.
     pub rx_boost: bool,
-    /// This node's address (1-255). Must be unique on the network: it is
-    /// how receivers tell one sender's positions from another's, and two
-    /// nodes sharing one are mutually deaf - each drops the other's frames
-    /// as its own echo.
+    /// This node's address (1-255). It travels in every frame this node
+    /// originates and is how receivers tell one sender's positions from
+    /// another's, so it must be unique among the nodes that transmit: two
+    /// senders sharing one are mutually deaf, each dropping the other's
+    /// frames as an echo of its own.
+    ///
+    /// A [`Role::RxOnly`] node originates nothing, so its address never
+    /// reaches the air and cannot collide with anyone's. Leaving it at the
+    /// default is fine.
     pub address: u8,
     /// Which halves of the air interface this node uses, and whether it
     /// retransmits other nodes' frames.
