@@ -12,7 +12,8 @@
 //! - WIO soft sleep / GPS backup mode (forwarded over the link; a stuck
 //!   WIO is woken with a reset pulse on GPIO6)
 //! - ESP deep sleep with a periodic wake-check: the C6 sleeps whenever no
-//!   central is connected, waking every interval to advertise briefly
+//!   central is connected, waking every interval to advertise for a
+//!   configurable window
 //! - Radio TOML config and WIO firmware images pushed through the bulk
 //!   characteristic and streamed over the UART link
 //!
@@ -88,10 +89,6 @@ macro_rules! vprintln {
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 1;
 
-/// How long to advertise on a sleep-mode wake check before going back to
-/// deep sleep. A budget for the whole wake, not per connection attempt:
-/// see the deadline in `serve_task`.
-const WAKE_ADV_WINDOW_S: u64 = 15;
 /// How long to keep advertising after a disconnect (sleep mode active) so
 /// the phone can come straight back before the C6 vanishes.
 const SLEEP_LINGER_S: u64 = 5;
@@ -153,6 +150,9 @@ const PFLAG_GPS_SLEEP: u32 = 1 << 2;
 struct Persist {
     sleep_interval_s: u32,
     flags: u32,
+    /// 0 = never configured; read it through `adv_window_s`, which
+    /// substitutes the default.
+    adv_window_s: u32,
 }
 
 // These live in RTC fast RAM and are not reinitialized on a deep-sleep
@@ -165,17 +165,21 @@ static PERSIST_MAGIC_WORD: PersistU32 = PersistU32::new(0);
 static PERSIST_INTERVAL: PersistU32 = PersistU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static PERSIST_FLAGS: PersistU32 = PersistU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static PERSIST_ADV_WINDOW: PersistU32 = PersistU32::new(0);
 
 fn persist_get() -> Persist {
     if PERSIST_MAGIC_WORD.load(PersistOrdering::Relaxed) == PERSIST_MAGIC {
         Persist {
             sleep_interval_s: PERSIST_INTERVAL.load(PersistOrdering::Relaxed),
             flags: PERSIST_FLAGS.load(PersistOrdering::Relaxed),
+            adv_window_s: PERSIST_ADV_WINDOW.load(PersistOrdering::Relaxed),
         }
     } else {
         Persist {
             sleep_interval_s: 0,
             flags: 0,
+            adv_window_s: 0,
         }
     }
 }
@@ -185,6 +189,7 @@ fn persist_update(f: impl FnOnce(&mut Persist)) {
     f(&mut p);
     PERSIST_INTERVAL.store(p.sleep_interval_s, PersistOrdering::Relaxed);
     PERSIST_FLAGS.store(p.flags, PersistOrdering::Relaxed);
+    PERSIST_ADV_WINDOW.store(p.adv_window_s, PersistOrdering::Relaxed);
     PERSIST_MAGIC_WORD.store(PERSIST_MAGIC, PersistOrdering::Relaxed);
 }
 
@@ -207,10 +212,18 @@ const NVS_MAGIC: u32 = 0x6D69_6441; // "midA"
 /// Version 2 dropped the stow interval. A version 1 record fails the check
 /// in `nvs_decode` and is ignored, which leaves the board awake rather than
 /// reading the old stow word as something else.
-const NVS_VERSION: u32 = 2;
-/// magic, version, sleep, flags, crc32 - all u32, so the length is
-/// already a multiple of the flash write word.
-const NVS_RECORD_LEN: usize = 20;
+///
+/// Version 3 appended the advertising window. That one is a pure append, so
+/// `nvs_decode` still reads a version 2 record rather than discarding it -
+/// a board updated in the field keeps the cadence it was left on instead of
+/// coming back advertising continuously.
+const NVS_VERSION: u32 = 3;
+/// magic, version, sleep, flags, adv window, crc32 - all u32, so the length
+/// is already a multiple of the flash write word.
+const NVS_RECORD_LEN: usize = 24;
+/// Where the crc32 sits in a version 2 record, which is the version 3
+/// layout minus its last word.
+const NVS_V2_CRC_AT: usize = 16;
 
 /// Resolved `nvs` partition offset, 0 = lookup failed (no partition table
 /// or no such partition). Settings then degrade to RTC RAM only.
@@ -225,22 +238,32 @@ fn nvs_encode(p: &Persist) -> [u8; NVS_RECORD_LEN] {
     rec[4..8].copy_from_slice(&NVS_VERSION.to_le_bytes());
     rec[8..12].copy_from_slice(&p.sleep_interval_s.to_le_bytes());
     rec[12..16].copy_from_slice(&p.flags.to_le_bytes());
-    let crc = link::crc32(&rec[0..16]);
-    rec[16..20].copy_from_slice(&crc.to_le_bytes());
+    rec[16..20].copy_from_slice(&p.adv_window_s.to_le_bytes());
+    let crc = link::crc32(&rec[0..20]);
+    rec[20..24].copy_from_slice(&crc.to_le_bytes());
     rec
 }
 
 fn nvs_decode(rec: &[u8; NVS_RECORD_LEN]) -> Option<Persist> {
     let word = |i: usize| u32::from_le_bytes(rec[i..i + 4].try_into().unwrap());
-    if word(0) != NVS_MAGIC || word(4) != NVS_VERSION {
+    if word(0) != NVS_MAGIC {
         return None;
     }
-    if word(16) != link::crc32(&rec[0..16]) {
+    // A version 2 record stops one word short and carries no window, which
+    // reads back as the default. Its trailing bytes are erased flash, so
+    // the crc has to be checked where that version put it.
+    let (crc_at, adv_window_s) = match word(4) {
+        2 => (NVS_V2_CRC_AT, 0),
+        NVS_VERSION => (NVS_RECORD_LEN - 4, word(NVS_RECORD_LEN - 8)),
+        _ => return None,
+    };
+    if word(crc_at) != link::crc32(&rec[0..crc_at]) {
         return None;
     }
     Some(Persist {
         sleep_interval_s: word(8),
         flags: word(12),
+        adv_window_s,
     })
 }
 
@@ -317,12 +340,24 @@ fn current_settings() -> ble::Settings {
         gps_sleep: p.flags & PFLAG_GPS_SLEEP != 0,
         sleep_interval_s: p.sleep_interval_s,
         notify_interval_ms: NOTIFY_INTERVAL_MS.lock(|c| c.get()),
+        adv_window_s: adv_window_s(),
     }
 }
 
 /// Interval for the next deep sleep, 0 = stay awake and keep advertising.
 fn next_sleep_interval_s() -> u32 {
     persist_get().sleep_interval_s
+}
+
+/// How long a wake check advertises for. A stored 0 means never
+/// configured, not "do not advertise" - a zero window would leave a
+/// sleeping board unreachable by anything but a physical reset, so it
+/// resolves to the default instead.
+fn adv_window_s() -> u32 {
+    match persist_get().adv_window_s {
+        0 => ble::ESP_ADV_DEFAULT_S,
+        s => s,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,8 +868,10 @@ async fn main(spawner: Spawner) -> ! {
         if let Some(saved) = nvs_load() {
             persist_update(|p| *p = saved);
             println!(
-                "nvs: restored sleep {} s, flags {:#x}",
-                saved.sleep_interval_s, saved.flags
+                "nvs: restored sleep {} s, adv window {} s, flags {:#x}",
+                saved.sleep_interval_s,
+                adv_window_s(),
+                saved.flags
             );
         }
     }
@@ -1003,7 +1040,10 @@ async fn serve_task<C: Controller>(
     // each attempt separately let a central that kept failing to connect reset
     // the budget forever, so the board woke, drew its full advertising current
     // and never slept again. A deadline cannot be restarted by a retry.
-    let mut wake_ends = Instant::now() + Duration::from_secs(WAKE_ADV_WINDOW_S);
+    // Sampled once for this wake rather than per iteration: a window shortened
+    // over BLE takes effect on the next wake, so it cannot retroactively strand
+    // a board mid-window with its budget already spent.
+    let mut wake_ends = Instant::now() + Duration::from_secs(adv_window_s() as u64);
 
     loop {
         let sleep_interval = next_sleep_interval_s();
@@ -1263,6 +1303,20 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                     persist_update(|p| p.sleep_interval_s = secs);
                     nvs_save();
                     qprintln!("config: esp sleep interval {} s", secs);
+                    return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
+                }
+                return packet::encode_ack(id, packet::ACK_BAD_VALUE, &[]);
+            }
+            ble::CFG_ESP_ADV_WINDOW_S => {
+                if let Ok(bytes) = <[u8; 4]>::try_from(value) {
+                    // Clamped unconditionally: unlike the sleep interval, 0 is
+                    // not an "off" here, so it comes up to the floor instead of
+                    // being stored as a window nobody could ever connect in.
+                    let secs =
+                        u32::from_le_bytes(bytes).clamp(ble::ESP_ADV_MIN_S, ble::ESP_ADV_MAX_S);
+                    persist_update(|p| p.adv_window_s = secs);
+                    nvs_save();
+                    qprintln!("config: advertising window {} s", secs);
                     return packet::encode_ack(id, packet::ACK_OK, &secs.to_le_bytes());
                 }
                 return packet::encode_ack(id, packet::ACK_BAD_VALUE, &[]);

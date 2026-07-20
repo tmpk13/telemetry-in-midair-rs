@@ -42,13 +42,14 @@ pub const SETTINGS_UUID: &str = "c3a10009-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const SETTINGS_UUID_U128: u128 = 0xc3a10009_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
 /// Wire length of [`Settings`].
-pub const SETTINGS_LEN: usize = 12;
+pub const SETTINGS_LEN: usize = 16;
 /// Layout version in byte 0, so an app meeting a newer firmware can
 /// reject the blob rather than misread it.
 ///
 /// Version 2 dropped the separate stow interval: one wake-check interval
-/// now covers every sleep the board does.
-pub const SETTINGS_VERSION: u8 = 2;
+/// now covers every sleep the board does. Version 3 appended the
+/// advertising window.
+pub const SETTINGS_VERSION: u8 = 3;
 
 pub const SFLAG_PWR_EN: u8 = 1 << 0;
 pub const SFLAG_WIO_SLEEP: u8 = 1 << 1;
@@ -67,6 +68,9 @@ pub struct Settings {
     pub sleep_interval_s: u32,
     /// Position notify interval in ms (gps-proto config id 0x01).
     pub notify_interval_ms: u32,
+    /// Advertising window per wake check ([`CFG_ESP_ADV_WINDOW_S`]). Always
+    /// the effective value, never 0.
+    pub adv_window_s: u32,
 }
 
 impl Settings {
@@ -87,6 +91,7 @@ impl Settings {
         // b[2..4] reserved, kept zero to word-align the u32s.
         b[4..8].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
         b[8..12].copy_from_slice(&self.notify_interval_ms.to_le_bytes());
+        b[12..16].copy_from_slice(&self.adv_window_s.to_le_bytes());
         b
     }
 
@@ -103,6 +108,7 @@ impl Settings {
             gps_sleep: b[1] & SFLAG_GPS_SLEEP != 0,
             sleep_interval_s: word(4),
             notify_interval_ms: word(8),
+            adv_window_s: word(12),
         })
     }
 }
@@ -136,6 +142,28 @@ pub const CFG_ESP_SLEEP_S: u8 = 0x13;
 /// board is always a wait rather than a lockout.
 pub const ESP_SLEEP_MIN_S: u32 = 5;
 pub const ESP_SLEEP_MAX_S: u32 = 5 * 60;
+
+/// `u32` seconds: how long each sleep-mode wake check advertises before
+/// going back to deep sleep. Only meaningful while [`CFG_ESP_SLEEP_S`] is
+/// set; a board that never sleeps advertises continuously regardless.
+///
+/// This is the knob that sets the duty cycle, and so the average current:
+/// advertising costs roughly two orders of magnitude more than deep sleep,
+/// so at a fixed interval the window is what the draw is proportional to.
+/// Shortening it buys battery life directly, at the cost of asking more of
+/// whoever is trying to connect - the window has to overlap a phone's scan.
+pub const CFG_ESP_ADV_WINDOW_S: u8 = 0x14;
+
+/// Clamp range and default for [`CFG_ESP_ADV_WINDOW_S`].
+///
+/// The floor is not a comfortable connect time, it is the point below
+/// which a window stops being worth waking for at all - a phone that only
+/// scans intermittently can miss several 3 s windows in a row. The ceiling
+/// exists because a window is time spent at full advertising current;
+/// past a minute, shortening the interval is the better trade.
+pub const ESP_ADV_MIN_S: u32 = 3;
+pub const ESP_ADV_MAX_S: u32 = 60;
+pub const ESP_ADV_DEFAULT_S: u32 = 15;
 
 // -- Bulk transfer protocol (writes on [`BULK_UUID`]) -------------------------
 //
@@ -203,6 +231,7 @@ mod tests {
             gps_sleep: true,
             sleep_interval_s: 300,
             notify_interval_ms: 1000,
+            adv_window_s: 15,
         };
         let bytes = s.encode();
         assert_eq!(bytes.len(), super::SETTINGS_LEN);

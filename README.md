@@ -125,7 +125,7 @@ mis-wired WIO shows on the console instead of just going silent. The
 ping (`cargo run --release --features verbose`).
 
 The settings characteristic (`c3a10009-...`, read + notify) carries the
-device's current power/sleep configuration as one 12-byte blob
+device's current power/sleep configuration as one 16-byte blob
 (`midair_proto::ble::Settings`), so an app can populate its controls on
 connect rather than assuming defaults. It is republished after every
 config write - including values the device changed itself, such as a
@@ -140,14 +140,28 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x11` | u8 0/1 | WIO soft sleep (reset-pulse fallback on wake) |
 | `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / EXTINT wake) |
 | `0x13` | u32 s | ESP deep-sleep wake-check interval, 5 s..5 min, 0 = off |
+| `0x14` | u32 s | advertising window per wake check, 3 s..60 s (default 15 s) |
 
 ### Low power
 
-`0x13` is the only sleep control. While set, the C6 deep-sleeps whenever
-no central is connected and wakes every interval to advertise for 15 s
-(one long D2 blink). It persists until changed - a connect does not clear
-it, so an unattended board holds its cadence indefinitely and the setting
-means the same thing whether or not anyone is looking.
+`0x13` turns sleep on. While set, the C6 deep-sleeps whenever no central
+is connected and wakes every interval to advertise for `0x14` seconds (one
+long D2 blink). Both persist until changed - a connect does not clear
+them, so an unattended board holds its cadence indefinitely and the
+settings mean the same thing whether or not anyone is looking.
+
+Together the two set the duty cycle, and so the average current:
+advertising costs roughly two orders of magnitude more than deep sleep, so
+the draw tracks window/interval almost exactly. The window is the more
+useful knob of the two, because shortening it does not make the board any
+slower to reach - a 5 s window at a 60 s interval is still four times the
+battery life of the 15 s default, and still gets you a wake every minute.
+What it costs is margin: the window has to overlap a phone's scan, and a
+phone that only scans intermittently can miss several short windows in a
+row. Unlike the interval, `0x14` has no "off" - a 0 clamps up to 3 s
+rather than being stored as a window nobody could connect in.
+
+A window changed over BLE applies from the next wake, not the current one.
 
 The GPS/LoRa rail is **off** for the whole sleep and stays off through
 the advertising window - a wake that nobody answers never powers the WIO
@@ -155,7 +169,8 @@ or GPS at all. The rail comes up only when a central actually connects
 (and only if `0x10` has it enabled), so the app should expect the WIO's
 boot time plus a GPS cold TTFF after connecting.
 
-The interval and the `0x10` rail setting are held in RTC RAM and mirrored
+The interval, the window and the `0x10` rail setting are held in RTC RAM
+and mirrored
 to the ESP's `nvs` flash partition, so they survive deep sleep *and* a
 flat battery - a board put away for transport comes back on the same
 cadence rather than advertising until the cell dies again. Flash is read
@@ -168,9 +183,10 @@ drifts - it paces a wake-check, not a schedule.
 interrupt it: the radio is off, and there is no GPIO or button wake
 configured. The 5 min ceiling on `0x13` is what bounds that - it is the
 longest the board can ever be unreachable, short of a physical reset. A
-reset does get you back sooner, but a cold boot restores the interval
-from flash and the first advertising window is still the same 15 s, so it
-buys you a window you chose the timing of rather than an awake board.
+reset does get you back sooner, but a cold boot restores the settings from
+flash and the first advertising window is the same `0x14` seconds as any
+other, so it buys you a window you chose the timing of rather than an
+awake board.
 
 ## SD card
 
