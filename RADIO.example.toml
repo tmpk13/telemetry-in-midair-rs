@@ -56,29 +56,27 @@ tcxo_volts_type = "enum:1.6,1.7,1.8,2.2,2.4,2.7,3.0,3.3"
 tcxo_startup_ms = 10
 tcxo_startup_ms_description = "How long the radio waits for the TCXO to settle before using the clock, 1-1000 ms."
 
-# Low-data-rate optimization is derived automatically from spreading
-# factor and bandwidth; there is no key for it.
-
 # -- Network ------------------------------------------------------------
-# Everything is broadcast. Leaves hear each other directly, so a fleet of
+# Everything is sent. Leaves hear each other directly, so a fleet of
 # nothing but leaves is a working network and these defaults need no
 # changing. A repeater is for covering ground no pair of leaves can reach
-# across on their own.
+# across on their own. tx_only and rx_only split a leaf in half, for a
+# deployment where the reporting only ever runs one way.
 [network]
 address = 1
-address_description = "This node's address, 1-255. Must be unique on the network - it is how receivers tell one sender's positions from another's."
+address_description = "This node's address, 1-255. Must be unique on the network. Two nodes sharing an address are mutually deaf: each drops the other's broadcasts as an echo of its own, so neither ever sees the other."
 
 role = "leaf"
-role_description = "leaf transmits and receives only. repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards."
-role_type = "enum:leaf,repeater"
+role_description = "leaf transmits its own position and receives everyone else's. Repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards. tx_only beacons without ever switching the receiver on, which is the largest power saving available to a node nobody needs to track from. rx_only listens without ever transmitting, for a base station that only collects."
+role_type = "enum:leaf,repeater,tx_only,rx_only"
 
 max_hops = 1
-max_hops_description = "Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no repeater forwards it; 1 covers a single-repeater deployment. This is a property of the sender, so raising it does not require touching the repeaters."
+max_hops_description = "Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no repeater forwards it."
 
 # -- Beacon -------------------------------------------------------------
 [beacon]
 interval_s = 10
-interval_s_description = "Position broadcast period in seconds, 0-3600. 0 disables the beacon."
+interval_s_description = "Position broadcast period in seconds, 0-3600. 0 disables the beacon, as does a role of rx_only."
 
 fields = "lat,lon"
 fields_description = "Which GPS fields each broadcast carries: lat, lon, altitude, speed, course, sats, time. lat and lon are required. More fields result in more air time."

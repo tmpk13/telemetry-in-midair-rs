@@ -8,6 +8,11 @@
 //! placed to extend that range: it retransmits frames that still carry
 //! hops, and is the only thing that has to be configured differently.
 //!
+//! [`Role::TxOnly`] and [`Role::RxOnly`] drop one half of that. Position
+//! reporting is one-way, so a node that is only ever tracked can keep its
+//! receiver off and a node that only collects can stay off the air - each
+//! saving the power the unused half would cost.
+//!
 //! Two mechanisms keep repeating from turning into a broadcast storm:
 //!
 //! - **Deduplication.** A frame is identified by `(src, id)`. One that has
@@ -59,6 +64,8 @@ pub struct Received<'a> {
 pub enum TxError<E> {
     /// Payload is empty or longer than [`midair_proto::lora::PAYLOAD_MAX`].
     Payload,
+    /// This node's role does not transmit.
+    Muted,
     /// The radio rejected the transmission.
     Radio(E),
 }
@@ -136,9 +143,10 @@ impl<R: PacketRadio> Node<R> {
         self.address
     }
 
-    /// Whether this node repeats other nodes' frames.
-    pub fn is_repeater(&self) -> bool {
-        self.role == Role::Repeater
+    /// This node's role. Ask it directly what the node does on the air:
+    /// [`Role::transmits`], [`Role::receives`], [`Role::repeats`].
+    pub fn role(&self) -> Role {
+        self.role
     }
 
     /// The radio, for diagnostics and power state.
@@ -163,7 +171,13 @@ impl<R: PacketRadio> Node<R> {
     }
 
     /// Broadcast a payload as a new frame from this node.
+    ///
+    /// Fails with [`TxError::Muted`] on a receive-only node rather than
+    /// reporting a success nothing heard.
     pub fn broadcast(&mut self, payload: &[u8]) -> Result<(), TxError<R::Error>> {
+        if !self.role.transmits() {
+            return Err(TxError::Muted);
+        }
         let frame = Frame {
             src: self.address,
             id: self.next_id,
@@ -209,7 +223,7 @@ impl<R: PacketRadio> Node<R> {
         if self.mark_seen(src, id, now) {
             return None;
         }
-        if self.role == Role::Repeater && hops_left > 0 {
+        if self.role.repeats() && hops_left > 0 {
             let due = now.wrapping_add(platform::random(0, self.jitter_ms as i32) as u32);
             let onward = Frame {
                 src,

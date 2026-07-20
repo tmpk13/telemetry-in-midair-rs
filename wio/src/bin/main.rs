@@ -29,7 +29,7 @@ mod app {
 
     use midair_proto::link::{self, cmd, msg, Telemetry};
     use midair_proto::lora;
-    use midair_proto::radiocfg::{self, RadioConfig};
+    use midair_proto::radiocfg::{self, RadioConfig, Role};
     use rtt_target::{rprintln, rtt_init, set_print_channel};
     use stm32wlxx_hal::{
         gpio::{PortA, PortB},
@@ -170,7 +170,12 @@ mod app {
         rprintln!(
             "Node {} ready ({})",
             cfg.address,
-            if node.is_repeater() { "repeater" } else { "leaf" }
+            match node.role() {
+                Role::Leaf => "leaf",
+                Role::Repeater => "repeater",
+                Role::TxOnly => "transmit only",
+                Role::RxOnly => "receive only",
+            }
         );
 
         run::spawn().unwrap();
@@ -418,7 +423,10 @@ mod app {
             }
 
             // ---- LoRa position beacon --------------------------------------
-            if cfg.beacon_interval_s != 0 && due(now, next_beacon) {
+            // Gated on the role here rather than inside the transmit, so a
+            // receive-only node never claims the air with RADIO_BUSY for a
+            // broadcast it was never going to send.
+            if cfg.role.transmits() && cfg.beacon_interval_s != 0 && due(now, next_beacon) {
                 if gps.has_fix() && !esp.peer_busy(now) {
                     let (data, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
                     let data = &data[..n];

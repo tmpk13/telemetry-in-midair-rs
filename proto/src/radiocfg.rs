@@ -24,7 +24,7 @@
 //!
 //! [mesh]
 //! address = 1               # 1-255
-//! role = "leaf"             # leaf | repeater
+//! role = "leaf"             # leaf | repeater | tx_only | rx_only
 //! max_hops = 1              # retransmissions allowed per broadcast
 //!
 //! [beacon]
@@ -33,7 +33,14 @@
 
 use crate::lora;
 
-/// What a node does with frames that did not originate on it.
+/// Which halves of the air interface a node uses.
+///
+/// Position reporting is one-way traffic, so a node does not have to do
+/// both halves. A tracker that is only ever reported *on* can leave its
+/// receiver off; a base station that only collects reports never needs to
+/// transmit. Each saves the power the unused half costs, and on a tracker
+/// that is the larger saving by far: continuous RX draws current every
+/// second between beacons, while a beacon is milliseconds of TX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Originates its own broadcasts and receives everyone else's, but
@@ -43,6 +50,31 @@ pub enum Role {
     /// A leaf that additionally retransmits frames still carrying hops,
     /// extending the network past one radio horizon.
     Repeater,
+    /// Beacons its own position and nothing else. The receiver is never
+    /// enabled, so this node hears no one, repeats nothing, and reports no
+    /// peers - it exists only in other nodes' logs.
+    TxOnly,
+    /// Listens and reports what it hears, never transmitting. Its own
+    /// beacon is off whatever `beacon_interval_s` says, since a beacon is a
+    /// transmission.
+    RxOnly,
+}
+
+impl Role {
+    /// Whether this node ever puts a frame on the air.
+    pub fn transmits(self) -> bool {
+        !matches!(self, Role::RxOnly)
+    }
+
+    /// Whether this node enables its receiver at all.
+    pub fn receives(self) -> bool {
+        !matches!(self, Role::TxOnly)
+    }
+
+    /// Whether this node retransmits other nodes' frames.
+    pub fn repeats(self) -> bool {
+        matches!(self, Role::Repeater)
+    }
 }
 
 /// Supply voltage the radio drives the TCXO at (`SetTcxoMode` trim field).
@@ -197,9 +229,12 @@ pub struct RadioConfig {
     /// intermediate values have no specified behavior to expose.
     pub rx_boost: bool,
     /// This node's address (1-255). Must be unique on the network: it is
-    /// how receivers tell one sender's positions from another's.
+    /// how receivers tell one sender's positions from another's, and two
+    /// nodes sharing one are mutually deaf - each drops the other's frames
+    /// as its own echo.
     pub address: u8,
-    /// Whether this node retransmits other nodes' frames.
+    /// Which halves of the air interface this node uses, and whether it
+    /// retransmits other nodes' frames.
     pub role: Role,
     /// Retransmissions allowed for a broadcast this node originates, i.e.
     /// the `hops_left` it stamps into the frame. 0 means no repeater will
@@ -413,6 +448,8 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 cfg.role = match unquote(value) {
                     "leaf" => Role::Leaf,
                     "repeater" => Role::Repeater,
+                    "tx_only" => Role::TxOnly,
+                    "rx_only" => Role::RxOnly,
                     _ => return Err(ConfigError::BadValue(lineno)),
                 };
             }
@@ -651,6 +688,42 @@ mod tests {
         assert_eq!(parse("role = repeater").unwrap().role, Role::Repeater);
         assert_eq!(parse("role = \"gateway\""), Err(ConfigError::BadValue(1)));
         assert_eq!(parse("max_hops = 9"), Err(ConfigError::OutOfRange(1)));
+    }
+
+    #[test]
+    fn one_way_roles_parse() {
+        assert_eq!(parse("role = \"tx_only\"").unwrap().role, Role::TxOnly);
+        assert_eq!(parse("role = \"rx_only\"").unwrap().role, Role::RxOnly);
+        // Near misses are typos, not a mode to guess at.
+        assert_eq!(parse("role = \"tx\""), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("role = \"txonly\""), Err(ConfigError::BadValue(1)));
+    }
+
+    /// Each role uses exactly the halves of the air interface it names, and
+    /// only a repeater forwards. These drive the radio's idle state and the
+    /// beacon gate, so getting one wrong is a node that is silently deaf or
+    /// silently mute.
+    #[test]
+    fn roles_use_the_halves_they_name() {
+        for (role, tx, rx, repeats) in [
+            (Role::Leaf, true, true, false),
+            (Role::Repeater, true, true, true),
+            (Role::TxOnly, true, false, false),
+            (Role::RxOnly, false, true, false),
+        ] {
+            assert_eq!(role.transmits(), tx, "{role:?} transmits");
+            assert_eq!(role.receives(), rx, "{role:?} receives");
+            assert_eq!(role.repeats(), repeats, "{role:?} repeats");
+        }
+    }
+
+    /// A repeater has to hear a frame before it can forward one, so no role
+    /// may repeat without receiving.
+    #[test]
+    fn repeating_implies_receiving() {
+        for role in [Role::Leaf, Role::Repeater, Role::TxOnly, Role::RxOnly] {
+            assert!(!role.repeats() || role.receives(), "{role:?}");
+        }
     }
 
     #[test]

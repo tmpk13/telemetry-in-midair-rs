@@ -50,6 +50,10 @@ pub enum Sx1262Error {
 pub struct Sx1262Driver {
     radio: SubGhz<SgMiso, SgMosi>,
     rx_active: bool,
+    /// Whether the receiver is used at all. False on a transmit-only node,
+    /// which idles in standby instead of continuous RX - that idle current
+    /// is the whole reason the mode exists.
+    listen: bool,
     /// SNR of the last received packet in centibels.
     last_snr_cb: i16,
     tx_poll_timeout_ms: u32,
@@ -62,6 +66,7 @@ impl Sx1262Driver {
         Self {
             radio,
             rx_active: false,
+            listen: true,
             last_snr_cb: 0,
             tx_poll_timeout_ms: 250,
             tx_chip_timeout_ms: 750,
@@ -76,6 +81,7 @@ impl Sx1262Driver {
     pub fn init(&mut self, cfg: &RadioConfig) {
         debug_println!("Initialising SubGHz radio...");
         self.rx_active = false;
+        self.listen = cfg.role.receives();
         self.tx_poll_timeout_ms = cfg.tx_poll_timeout_ms();
         self.tx_chip_timeout_ms = cfg.tx_chip_timeout_ms();
 
@@ -294,6 +300,12 @@ impl PacketRadio for Sx1262Driver {
     type Error = Sx1262Error;
 
     fn poll_recv(&mut self, buf: &mut [u8]) -> Result<Option<(usize, i16)>, Self::Error> {
+        // A transmit-only node never arms the receiver: this is the call
+        // that would otherwise enter continuous RX and hold it there.
+        if !self.listen {
+            return Ok(None);
+        }
+
         // Enter continuous RX if not already listening.
         if !self.rx_active {
             self.radio
@@ -410,10 +422,16 @@ impl PacketRadio for Sx1262Driver {
 
         // Re-enter continuous RX immediately: the node is deaf while it
         // transmits, so every millisecond spent out of RX after TxDone is
-        // another chance to miss someone else's broadcast.
-        if self.radio.set_rx(Timeout::DISABLED).is_ok() {
+        // another chance to miss someone else's broadcast. A transmit-only
+        // node has nothing to miss and drops back to standby instead.
+        if self.listen {
+            if self.radio.set_rx(Timeout::DISABLED).is_ok() {
+                self.wait_on_busy();
+                self.rx_active = true;
+            }
+        } else {
+            self.radio.set_standby(StandbyClk::Rc).ok();
             self.wait_on_busy();
-            self.rx_active = true;
         }
 
         result
