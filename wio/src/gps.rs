@@ -25,6 +25,14 @@ pub const BAUD: u32 = 9_600;
 /// Longest NMEA sentence: 82 characters including "$" and CRLF.
 const NMEA_MAX: usize = 82;
 
+/// Bytes drained from USART1 per [`poll`](Gps::poll) call. A fix at the 1 Hz
+/// default emits a few hundred bytes a second, so the main loop's ~1 kHz
+/// polling never approaches this in normal use; the cap exists for the
+/// opposite case, where no module is attached and the floating RX pin streams
+/// noise. Bounding the drain keeps that from monopolizing the loop and
+/// starving the radio receive, so a node with no GPS still hears the network.
+const DRAIN_BUDGET: usize = 512;
+
 /// Largest UBX payload this driver builds. The CFG-VALSET frame it emits
 /// (4-byte header + nine key/value pairs) is well under this.
 const UBX_MAX_PAYLOAD: usize = 64;
@@ -149,7 +157,7 @@ impl Gps {
     /// Drain the UART and fold complete sentences into the position
     /// state. Call every main-loop iteration.
     pub fn poll(&mut self) {
-        loop {
+        for _ in 0..DRAIN_BUDGET {
             let byte = match self.uart.read() {
                 Ok(b) => b,
                 Err(nb::Error::WouldBlock) => return,
