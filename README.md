@@ -25,7 +25,7 @@ and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
 From `tools/` directory run
 `pixi run esp-upload`
 `pixi run wio-upload --address <#>`
-
+`pixi run esp-upload --ble-address XX:XX:XX:XX:XX:XX`
 
 **Directly running**
 ```sh

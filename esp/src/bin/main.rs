@@ -94,6 +94,64 @@ macro_rules! vprintln {
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 1;
 
+/// Build-time BLE address override, most-significant octet first (e.g.
+/// "FF:C6:A1:53:50:47"). `Some` only when `BLE_ADDRESS` was set at build
+/// time (build.rs validates and normalizes it, and emits nothing otherwise);
+/// `None` derives a per-chip address from the eFuse MAC instead.
+const BLE_ADDRESS_OVERRIDE: Option<&str> = option_env!("BLE_ADDRESS");
+
+/// The board's BLE address as the LSB-first array `Address::random` expects.
+///
+/// With no build-time override, it is derived from the chip's factory MAC in
+/// eFuse so every board is unique out of the box: the MAC's most-significant
+/// octet gets its top two bits set, which is all a static-random address
+/// requires, and the per-chip low bytes keep it distinct.
+fn ble_address() -> [u8; 6] {
+    match BLE_ADDRESS_OVERRIDE {
+        Some(s) => parse_ble_address(s),
+        None => {
+            // read_base_mac_address is MSB-first; reverse to LSB-first and
+            // set the static-random bits on what becomes the MSB.
+            let mac = esp_hal::efuse::Efuse::read_base_mac_address();
+            let mut out = [0u8; 6];
+            for i in 0..6 {
+                out[i] = mac[5 - i];
+            }
+            out[5] |= 0xC0;
+            out
+        }
+    }
+}
+
+/// Parse an MSB-first address string ("FF:C6:A1:53:50:47") into the
+/// LSB-first array `Address::random` expects. build.rs has already validated
+/// any override, so a malformed octet here can only be a bug; it falls back
+/// to zero rather than panicking on the device.
+fn parse_ble_address(s: &str) -> [u8; 6] {
+    let mut out = [0u8; 6];
+    for (i, octet) in s.split(':').take(6).enumerate() {
+        out[5 - i] = u8::from_str_radix(octet, 16).unwrap_or(0);
+    }
+    out
+}
+
+/// Format an LSB-first address array as the MSB-first display string.
+fn fmt_ble_address(a: &[u8; 6]) -> heapless::String<17> {
+    use core::fmt::Write as _;
+    let mut s = heapless::String::new();
+    for i in (0..6).rev() {
+        let _ = write!(s, "{:02X}", a[i]);
+        if i != 0 {
+            let _ = s.push(':');
+        }
+    }
+    s
+}
+
+/// The board's BLE address (LSB-first), published for the USB info query.
+/// Set once at boot before the address is used.
+static BLE_ADDR: Mutex<CriticalSectionRawMutex, Cell<[u8; 6]>> = Mutex::new(Cell::new([0; 6]));
+
 /// How long to keep advertising after a disconnect (sleep mode active) so
 /// the phone can come straight back before the C6 vanishes.
 const SLEEP_LINGER_S: u64 = 5;
@@ -813,6 +871,16 @@ async fn usb_task(mut rx: UsbSerialJtagRx<'static, Async>, mut tx: UsbSerialJtag
                     out.build(link::resp::ACK, &[link::usb::PING, 1, 0]);
                     send_usb_frame(&mut tx, out.as_bytes()).await;
                 }
+                link::usb::INFO => {
+                    let a = BLE_ADDR.lock(|c| c.get());
+                    // MSB-first for display, matching the boot line.
+                    let mut reply = [link::usb::INFO, 0, 0, 0, 0, 0, 0];
+                    for i in 0..6 {
+                        reply[1 + i] = a[5 - i];
+                    }
+                    out.build(link::resp::ACK, &reply);
+                    send_usb_frame(&mut tx, out.as_bytes()).await;
+                }
                 link::usb::BULK => {
                     let (ack, alen) = handle_bulk(&p[..len], &mut bulk).await;
                     out.build(link::usb::BULK_ACK, &ack[..alen]);
@@ -879,6 +947,11 @@ async fn main(spawner: Spawner) -> ! {
     let sw_interrupt =
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+
+    // Resolve and publish the BLE address before any task can be asked for it
+    // over USB (see the info query in `usb_task`).
+    let addr_bytes = ble_address();
+    BLE_ADDR.lock(|c| c.set(addr_bytes));
 
     // Flash-backed settings. The table buffer is heap-scoped: it is 3 KiB,
     // wanted once, and too big to risk on the task stack.
@@ -966,9 +1039,9 @@ async fn main(spawner: Spawner) -> ! {
         BleConnector::new(&radio, peripherals.BT, Default::default()).expect("ble connector");
     let controller = ExternalController::<_, 20>::new(transport);
 
-    // Fixed static-random address (two MSBs set) for a stable identity.
-    let address = Address::random([0x47, 0x50, 0x53, 0xa1, 0xc6, 0xff]);
-    println!("BLE address: {:?}", address);
+    // Resolved and published above; print it in a fixed, parseable form.
+    let address = Address::random(addr_bytes);
+    println!("BLE-ADDR {}", fmt_ble_address(&addr_bytes));
 
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();

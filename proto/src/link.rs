@@ -95,6 +95,11 @@ pub mod usb {
     /// ESP -> host, `[id, status, value...]` - the gps-proto ack bytes the
     /// bulk op produced (status 0 = OK).
     pub const BULK_ACK: u8 = 0x52;
+    /// Host -> ESP, no payload. ESP answers [`super::resp::ACK`]
+    /// (`[INFO, addr[0]..addr[5]]`) with its BLE address most-significant
+    /// octet first, so a tool can read a board's address on demand rather
+    /// than having to catch the one line it prints at boot.
+    pub const INFO: u8 = 0x53;
 }
 
 /// Responses (either direction, follow a command).

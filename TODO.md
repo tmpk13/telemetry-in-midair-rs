@@ -54,6 +54,4 @@ GPS:
 
     Airborne <2g --> Stationary (When on ground). Timer?
 
-    Static hold?
-
 Beeper?

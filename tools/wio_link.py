@@ -28,6 +28,7 @@ RESP_NAK = 0x82
 USB_PING = 0x50
 USB_BULK = 0x51
 USB_BULK_ACK = 0x52
+USB_INFO = 0x53
 
 OP_BEGIN = 0x01
 OP_DATA = 0x02
@@ -274,6 +275,24 @@ def ping(ser: serial.Serial) -> bool:
     ser.flush()
     frame, _ = read_frame(ser, {RESP_ACK}, 2.0)
     return frame is not None and frame[1][:1] == bytes([USB_PING])
+
+
+def query_ble_address(ser: serial.Serial, timeout: float = 2.0) -> str | None:
+    """Ask the ESP for its BLE address on demand; return "FF:C6:..." or None.
+
+    The reply is [USB_INFO, addr[0]..addr[5]] with the address most-
+    significant octet first, so it prints directly.
+    """
+    ser.reset_input_buffer()
+    ser.write(build_frame(USB_INFO, b""))
+    ser.flush()
+    frame, _ = read_frame(ser, {RESP_ACK}, timeout)
+    if frame is None:
+        return None
+    payload = frame[1]
+    if len(payload) < 7 or payload[0] != USB_INFO:
+        return None
+    return ":".join(f"{b:02X}" for b in payload[1:7])
 
 
 def send_bulk(ser: serial.Serial, kind: int, data: bytes, version: int = 0,

@@ -28,4 +28,19 @@ wio-config = "python wio_config.py"
 # Build and flash the ESP32-C6 over its USB Serial/JTAG port, then stay
 # attached to the console. Per-frame link and heartbeat logging is on by
 # default; quiet it at runtime with `wio-config --set verbose=false`.
-esp-upload = { cmd = "cargo run --release", cwd = "../esp" }
+#
+# The BLE address defaults to one derived from the chip's eFuse MAC (unique
+# per board). --ble-address forces a specific one for this build.
+#   pixi run esp-upload
+#   pixi run esp-upload --ble-address FF:C6:A1:53:50:47
+esp-upload = "python esp_upload.py"
+
+# Read a connected board's BLE address over USB, on demand:
+#   pixi run esp-address
+esp-address = "python esp_address.py"
+
+# Generate a random BLE static-random address in the display format
+# esp-upload / BLE_ADDRESS expect:
+#   pixi run gen-ble-address
+#   pixi run esp-upload --ble-address "$(pixi run -q gen-ble-address)"
+gen-ble-address = "python gen_ble_address.py"
