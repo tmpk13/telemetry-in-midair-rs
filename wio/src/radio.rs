@@ -58,6 +58,13 @@ pub struct Sx1262Driver {
     last_snr_cb: i16,
     tx_poll_timeout_ms: u32,
     tx_chip_timeout_ms: u32,
+    /// Packets delivered by the radio that failed the hardware CRC, since
+    /// boot (saturating). A large count next to few good receptions points
+    /// at a weak signal or a link-parameter mismatch rather than nothing on
+    /// the air.
+    rx_crc_errors: u32,
+    /// Packets longer than the caller's buffer, dropped unread (saturating).
+    rx_oversize: u32,
 }
 
 impl Sx1262Driver {
@@ -70,7 +77,20 @@ impl Sx1262Driver {
             last_snr_cb: 0,
             tx_poll_timeout_ms: 250,
             tx_chip_timeout_ms: 750,
+            rx_crc_errors: 0,
+            rx_oversize: 0,
         }
+    }
+
+    /// Packets dropped since boot for a bad CRC and for overrunning the
+    /// caller's buffer. Both saturate; neither is cleared except by reboot.
+    pub fn rx_crc_errors(&self) -> u32 {
+        self.rx_crc_errors
+    }
+
+    /// Packets dropped since boot for exceeding the receive buffer.
+    pub fn rx_oversize(&self) -> u32 {
+        self.rx_oversize
     }
 
     /// Initialize (or re-initialize) the radio from `cfg`.
@@ -330,6 +350,7 @@ impl PacketRadio for Sx1262Driver {
         let _ = self.radio.clear_irq_status(0xFFFF);
 
         if crc_bad {
+            self.rx_crc_errors = self.rx_crc_errors.saturating_add(1);
             debug_println!("Dropped packet with bad CRC");
             return Ok(None);
         }
@@ -341,6 +362,7 @@ impl PacketRadio for Sx1262Driver {
         let len = len_u8 as usize;
 
         if len > buf.len() {
+            self.rx_oversize = self.rx_oversize.saturating_add(1);
             self.rx_active = false;
             return Ok(None);
         }

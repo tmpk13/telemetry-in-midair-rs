@@ -550,6 +550,25 @@ mod app {
                     sats: gps.packet().sats,
                 };
                 esp.send(msg::STATUS, &telem.encode());
+
+                // Verbose only: break down what the radio heard but did not
+                // deliver, so "a couple of random RXs" can be read as mostly
+                // CRC failures (weak signal / parameter mismatch), duplicates,
+                // or this node's own echoes rather than a mystery. Counts are
+                // cumulative since boot.
+                if cfg.verbose {
+                    let d = node.rx_drops();
+                    status_println!(
+                        esp,
+                        "rx {} ok; dropped crc {} dup {} echo {} malformed {} oversize {}",
+                        rx_count,
+                        node.radio().rx_crc_errors(),
+                        d.duplicate,
+                        d.own_echo,
+                        d.malformed,
+                        node.radio().rx_oversize(),
+                    );
+                }
             }
 
             // ---- SD housekeeping --------------------------------------------

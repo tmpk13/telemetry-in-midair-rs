@@ -20,7 +20,7 @@
 //! bandwidth_khz = 125       # 62, 125, 250, 500
 //! coding_rate = 5           # 4/5 .. 4/8
 //! power_dbm = 22            # -9 .. 22
-//! rx_boost = false          # boosted RX gain, ~+2 dB for more RX current
+//! rx_boost = true           # boosted RX gain, ~+2 dB for more RX current
 //!
 //! [mesh]
 //! address = 1               # 1-255
@@ -248,6 +248,17 @@ pub struct RadioConfig {
     /// This is a property of the sender, not of the repeaters, so raising
     /// it on one node does not require touching any other.
     pub max_hops: u8,
+    /// How long a `(src, id)` pair is remembered for deduplication, in
+    /// seconds. A frame seen again inside this window is neither delivered
+    /// again nor repeated again, which is what stops a frame reaching a node
+    /// by two paths from being handled twice and a repeater pair from
+    /// bouncing one between themselves.
+    ///
+    /// Ids wrap every 256 broadcasts, so this has to stay well under the time
+    /// that takes at the beacon interval in use, or a node's own sequence
+    /// would eventually collide with its remembered history and be suppressed
+    /// as a duplicate. At the 10 s default interval that wrap is ~43 min.
+    pub dedup_ttl_s: u16,
     /// Position broadcast interval in seconds (0 disables the beacon).
     pub beacon_interval_s: u16,
     /// Which [`PositionPacket`](gps_proto::packet::PositionPacket) fields the
@@ -302,7 +313,7 @@ impl Default for RadioConfig {
             // Off, matching the chip's power-up state: enabling it costs
             // receive current continuously on whichever node is listening,
             // which is a trade to opt into rather than inherit.
-            rx_boost: false,
+            rx_boost: true,
             address: 1,
             // Leaf by default: repeating is a job you give one well-placed
             // node, not something every node should do to every frame.
@@ -310,6 +321,7 @@ impl Default for RadioConfig {
             // Allow one repeat, so dropping a repeater into an existing
             // fleet works without reconfiguring the nodes already deployed.
             max_hops: 1,
+            dedup_ttl_s: 3,
             beacon_interval_s: 10,
             // Position only. Everything else a fix produces is written to
             // the SD log, where a byte costs nothing, rather than spent on
@@ -478,6 +490,17 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                     return Err(ConfigError::OutOfRange(lineno));
                 }
                 cfg.max_hops = v as u8;
+            }
+            "dedup_ttl_s" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                // Below 1 s dedup is effectively off; above the beacon-id
+                // wrap it starts suppressing a node's own later frames. The
+                // ceiling matches beacon_interval_s so neither can be set to
+                // a value the other makes nonsensical on its own.
+                if !(1..=3600).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.dedup_ttl_s = v as u16;
             }
             // Accepted so cards written for the old mesh keep the hop count
             // their author intended: it counted transmissions, where
@@ -756,6 +779,15 @@ mod tests {
         assert_eq!(parse("lifetime = 0"), Err(ConfigError::OutOfRange(1)));
         // listen_ms is gone; an old card carrying it still parses.
         assert_eq!(parse("listen_ms = 900").unwrap(), RadioConfig::default());
+    }
+
+    #[test]
+    fn dedup_ttl_parses_and_is_bounded() {
+        assert_eq!(RadioConfig::default().dedup_ttl_s, 3);
+        assert_eq!(parse("dedup_ttl_s = 120").unwrap().dedup_ttl_s, 120);
+        assert_eq!(parse("dedup_ttl_s = 0"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("dedup_ttl_s = 3601"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("dedup_ttl_s = often"), Err(ConfigError::BadValue(1)));
     }
 
     #[test]

@@ -31,14 +31,6 @@ use midair_proto::radiocfg::{RadioConfig, Role};
 use crate::platform;
 use crate::radio::PacketRadio;
 
-/// How long a `(src, id)` pair is remembered.
-///
-/// Ids wrap every 256 broadcasts, so this must stay well under the time
-/// that takes at any usable beacon interval or a node's own sequence would
-/// eventually collide with its remembered history and be dropped as a
-/// duplicate.
-const SEEN_TTL_MS: u32 = 60_000;
-
 /// Recently seen frames tracked for deduplication. Sized for more nodes
 /// than a shared 915 MHz channel can carry beacons for.
 const SEEN_SLOTS: usize = 16;
@@ -47,6 +39,20 @@ const SEEN_SLOTS: usize = 16;
 /// this means the channel is already saturated, so dropping is the honest
 /// response.
 const REPEAT_SLOTS: usize = 4;
+
+/// Running totals of packets the node dropped after the radio handed them
+/// up but before delivery, for diagnostics. Each saturates and is cleared
+/// only by reboot. Radio-layer drops (bad CRC, oversize) are counted
+/// separately on the radio, since a packet dropped there never reaches here.
+#[derive(Clone, Copy, Default)]
+pub struct RxDrops {
+    /// This node's own broadcast, echoed back by a repeater.
+    pub own_echo: u32,
+    /// A frame already seen inside the dedup window.
+    pub duplicate: u32,
+    /// A packet that did not decode as a frame.
+    pub malformed: u32,
+}
 
 /// A frame received from another node.
 pub struct Received<'a> {
@@ -93,6 +99,11 @@ pub struct Node<R: PacketRadio> {
     role: Role,
     max_hops: u8,
     jitter_ms: u32,
+    /// How long a `(src, id)` pair stays in `seen`, in milliseconds. From
+    /// [`RadioConfig::dedup_ttl_s`]; must stay well under the time the 8-bit
+    /// id takes to wrap at the beacon interval or a node suppresses its own
+    /// later frames as duplicates.
+    seen_ttl_ms: u32,
     /// Sequence number for the next frame this node originates.
     next_id: u8,
     seen: [Seen; SEEN_SLOTS],
@@ -101,6 +112,7 @@ pub struct Node<R: PacketRadio> {
     last_rssi: i16,
     last_rx_ms: u32,
     have_rx: bool,
+    drops: RxDrops,
 }
 
 impl<R: PacketRadio> Node<R> {
@@ -112,6 +124,7 @@ impl<R: PacketRadio> Node<R> {
             role: cfg.role,
             max_hops: cfg.max_hops,
             jitter_ms: cfg.repeat_jitter_ms(),
+            seen_ttl_ms: cfg.dedup_ttl_s as u32 * 1000,
             next_id: 0,
             seen: [Seen { src: 0, id: 0, at_ms: 0, valid: false }; SEEN_SLOTS],
             repeats: [Repeat { buf: [0; FRAME_MAX], len: 0, due_ms: 0, valid: false }; REPEAT_SLOTS],
@@ -119,6 +132,7 @@ impl<R: PacketRadio> Node<R> {
             last_rssi: 0,
             last_rx_ms: 0,
             have_rx: false,
+            drops: RxDrops::default(),
         }
     }
 
@@ -134,6 +148,7 @@ impl<R: PacketRadio> Node<R> {
         self.role = cfg.role;
         self.max_hops = cfg.max_hops;
         self.jitter_ms = cfg.repeat_jitter_ms();
+        self.seen_ttl_ms = cfg.dedup_ttl_s as u32 * 1000;
         self.seen = [Seen { src: 0, id: 0, at_ms: 0, valid: false }; SEEN_SLOTS];
         self.repeats.iter_mut().for_each(|r| r.valid = false);
     }
@@ -168,6 +183,13 @@ impl<R: PacketRadio> Node<R> {
     /// `None` if nothing has been heard yet.
     pub fn last_rx_ms(&self) -> Option<u32> {
         self.have_rx.then_some(self.last_rx_ms)
+    }
+
+    /// Cumulative counts of packets dropped after reaching the node, by
+    /// reason. Read alongside the radio's CRC/oversize counts for the full
+    /// picture of what is not being delivered.
+    pub fn rx_drops(&self) -> RxDrops {
+        self.drops
     }
 
     /// Broadcast a payload as a new frame from this node.
@@ -212,9 +234,12 @@ impl<R: PacketRadio> Node<R> {
         // Take the header out as values first: the bookkeeping below needs
         // `&mut self`, so the payload is borrowed back from `rx_buf` only
         // once that is done.
-        let (src, id, hops_left) = {
-            let f = Frame::decode(&self.rx_buf[..len])?;
-            (f.src, f.id, f.hops_left)
+        let (src, id, hops_left) = match Frame::decode(&self.rx_buf[..len]) {
+            Some(f) => (f.src, f.id, f.hops_left),
+            None => {
+                self.drops.malformed = self.drops.malformed.saturating_add(1);
+                return None;
+            }
         };
         // Our own broadcast, forwarded back to us by a repeater.
         //
@@ -224,9 +249,11 @@ impl<R: PacketRadio> Node<R> {
         // receive-only base station to exactly one node - most likely the
         // one that, like the base station, was left at the default address.
         if self.role.transmits() && src == self.address {
+            self.drops.own_echo = self.drops.own_echo.saturating_add(1);
             return None;
         }
         if self.mark_seen(src, id, now) {
+            self.drops.duplicate = self.drops.duplicate.saturating_add(1);
             return None;
         }
         if self.role.repeats() && hops_left > 0 {
@@ -276,13 +303,13 @@ impl<R: PacketRadio> Node<R> {
     }
 
     /// Record a `(src, id)` pair, returning whether it had already been
-    /// seen inside [`SEEN_TTL_MS`].
+    /// seen inside [`seen_ttl_ms`](Self::seen_ttl_ms).
     fn mark_seen(&mut self, src: u8, id: u8, now: u32) -> bool {
         let mut free: Option<usize> = None;
         let mut oldest = 0usize;
         for i in 0..SEEN_SLOTS {
             let s = self.seen[i];
-            if s.valid && now.wrapping_sub(s.at_ms) >= SEEN_TTL_MS {
+            if s.valid && now.wrapping_sub(s.at_ms) >= self.seen_ttl_ms {
                 self.seen[i].valid = false;
             }
             if !self.seen[i].valid {
