@@ -50,7 +50,7 @@ coding_rate_description = "Coding rate denominator 5-8 for 4/5..4/8. Higher adds
 power_dbm = 22
 power_dbm_description = "Transmit power in dBm, -9 to 22 on the high-power PA."
 
-rx_boost = false
+rx_boost = true
 rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for a few mA more current whenever the node is listening."
 
 # The three keys below describe the board the firmware is running on, not a
@@ -60,12 +60,12 @@ rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for 
 dcdc_enabled = true
 dcdc_enabled_description = "Use the internal DC-DC (SMPS) WIO-E5 supports this."
 
-tcxo_volts = "1.8"
-tcxo_volts_description = "Supply the radio drives the TCXO at. Wio-E5 uses a 1.8V part."
-tcxo_volts_type = "enum:1.6,1.7,1.8,2.2,2.4,2.7,3.0,3.3"
+# tcxo_volts = "1.8"
+# tcxo_volts_description = "Supply the radio drives the TCXO at. Wio-E5 uses a 1.8V part."
+# tcxo_volts_type = "enum:1.6,1.7,1.8,2.2,2.4,2.7,3.0,3.3"
 
-tcxo_startup_ms = 10
-tcxo_startup_ms_description = "How long the radio waits for the TCXO to settle before using the clock, 1-1000 ms."
+# tcxo_startup_ms = 10
+# tcxo_startup_ms_description = "How long the radio waits for the TCXO to settle before using the clock, 1-1000 ms."
 
 # -- Network ------------------------------------------------------------
 # Everything is sent. Leaves hear each other directly, so a fleet of

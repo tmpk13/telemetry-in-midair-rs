@@ -392,7 +392,7 @@ past the console text. Only one transfer (BLE or USB) runs at a time.
 Inital WIO wipe:
 `openocd -f interface/cmsis-dap.cfg -f target/stm32wlx.cfg -c "init; reset halt; stm32l4x unlock 0; reset halt; exit"`
 
-
+Power cycle after wiping before attempting to upload.
 
 
 ## Charging IC 
@@ -414,3 +414,6 @@ Fully running (BLE connected, Satalite fix, pulse on LoRa TX, SD logging)
 
 ESP only BLE connected
 `46 mA`
+
+GPS Board v1
+![GPS Board v1 diagram](./images/GPSv1.svg)

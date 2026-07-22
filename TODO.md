@@ -43,3 +43,17 @@ and let the chip drop straight into RX to catch the payload, or find the
 channel clear and go straight to TX. Cheaper than a full RX window for
 listen-before-talk, and it would give repeaters a real collision check
 before forwarding rather than the current random jitter.
+
+Will loading the program with the RADIO.CFG auto overwrite flags (Adress)?  
+
+
+GPS:
+    Ultra-high sensitivity mode
+    Navigation input filters
+    More lowe power?
+
+    Airborne <2g --> Stationary (When on ground). Timer?
+
+    Static hold?
+
+Beeper?
