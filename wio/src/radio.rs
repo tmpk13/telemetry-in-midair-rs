@@ -43,6 +43,14 @@ pub enum Sx1262Error {
     Timeout,
 }
 
+/// SetRx timeout value that selects continuous RX. On the SX126x the SetRx
+/// timeout doubles as a mode select: 0x000000 is single mode - the receiver
+/// stays on only until it decodes one packet, then drops to the fallback
+/// mode - while 0xFFFFFF keeps it in RX across packets. A node arms RX once
+/// and expects to keep hearing the network, so it must be the latter; single
+/// mode would leave a node that rarely transmits deaf after its first packet.
+const RX_CONTINUOUS: Timeout = Timeout::from_raw(0x00FF_FFFF);
+
 /// SubGHz radio driver that implements [`PacketRadio`].
 ///
 /// On the STM32WLE5 the SX1262 is integrated - the [`SubGhz`] peripheral
@@ -329,7 +337,7 @@ impl PacketRadio for Sx1262Driver {
         // Enter continuous RX if not already listening.
         if !self.rx_active {
             self.radio
-                .set_rx(Timeout::DISABLED)
+                .set_rx(RX_CONTINUOUS)
                 .map_err(|_| Sx1262Error::Radio)?;
             self.wait_on_busy();
             self.rx_active = true;
@@ -447,7 +455,7 @@ impl PacketRadio for Sx1262Driver {
         // another chance to miss someone else's broadcast. A transmit-only
         // node has nothing to miss and drops back to standby instead.
         if self.listen {
-            if self.radio.set_rx(Timeout::DISABLED).is_ok() {
+            if self.radio.set_rx(RX_CONTINUOUS).is_ok() {
                 self.wait_on_busy();
                 self.rx_active = true;
             }
